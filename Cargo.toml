@@ -1,0 +1,42 @@
+[package]
+name = "yubihsm-share-converter"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+# R9-H1: pinning the MSRV at 1.85 (was 1.70). MSRV 1.85 is the minimum
+# that parses Cargo.lock v4 (lockfile v4 stabilised in Cargo 1.78); we
+# bump to 1.85 for headroom against future stabilisation creep.
+# `std::io::IsTerminal` (used by the disk-stdout gate) was stabilised in
+# 1.70, so the gate's import remains available — that historical fact is
+# still supporting narrative for the pin, but the lockfile-v4 floor is
+# now the load-bearing reason. A downstream packager with an older
+# toolchain hits a clear `requires rustc 1.85.0 or newer`.
+rust-version = "1.85"
+description = "Recover yubihsm-setup (rusty-secrets 0.0.2, GF poly 0x11D) wrap-key shares and re-split them for yubihsm-manager (hand-rolled GF poly 0x11B Shamir split; manager-format output)."
+publish = false
+default-run = "yubihsm-share-converter"
+
+[dependencies]
+zeroize = { version = "1.7", features = ["zeroize_derive"] }
+constant_time_eq = "0.3"
+clap = { version = "4.5", features = ["derive"] }
+libc = "0.2"
+# R9-H3: vsss-rs removed. The resplit module hand-rolls GF(2^8)/poly-0x11B
+# Shamir split using Secret-controlled buffers (page-aligned, MADV_DONTDUMP,
+# zeroed-on-drop). vsss-rs 5.x leaked share bytes through internal coefficient
+# and per-share accumulator buffers that were outside our zeroize control.
+rand = "0.8"
+hex = "0.4"
+base64 = "0.22"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+
+[profile.release]
+panic = "abort"
+strip = "symbols"
+codegen-units = 1
+lto = "thin"
+overflow-checks = true
+debug = false

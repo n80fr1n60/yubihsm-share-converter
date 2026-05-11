@@ -1,0 +1,259 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true   # M7-6: cancel obsolete in-flight CI when a new commit lands
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build & Test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        toolchain: [stable, beta, "1.85"]
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install rustup (per-run sha256 verification)
+        env:
+          TOOLCHAIN: ${{ matrix.toolchain }}
+        run: |
+          set -e
+          # Sidecar pattern: download rustup-init AND its sha256 sidecar
+          # from the same canonical origin, then verify before exec. The
+          # .sha256 file is auto-rolled by the rustup release process —
+          # no manual SHA rotation ever needed in this workflow. Trust
+          # anchor: TLS pin to static.rust-lang.org + integrity check of
+          # the downloaded binary, both fetched over `=https` + tlsv1.2.
+          # The `command -v rustup` guard removes any preinstalled rustup
+          # on host runners so the sidecar install is the one actually
+          # used; in bare containers it is a no-op.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Build (release profile)
+        run: cargo build --release --locked --verbose
+
+      - name: Test (release profile)
+        run: cargo test --release --locked --verbose
+
+      - name: Doc
+        run: cargo doc --release --locked --verbose --no-deps
+
+  nightly:
+    name: Build & Test (nightly)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install rustup (per-run sha256 verification)
+        env:
+          TOOLCHAIN: nightly
+        run: |
+          set -e
+          # Sidecar pattern: see build-and-test for full rationale.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Build
+        run: cargo build --release --locked --verbose
+
+      - name: Test
+        run: cargo test --release --locked --verbose
+
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install rustup (per-run sha256 verification)
+        env:
+          TOOLCHAIN: stable
+        run: |
+          set -e
+          # Sidecar pattern: see build-and-test for full rationale.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install components (rustfmt, clippy)
+        run: rustup component add --toolchain stable rustfmt clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Run scripts/tests/lint.sh
+        run: bash scripts/tests/lint.sh
+
+  python-tests:
+    name: Python test harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.12"
+      - name: Install pexpect (pinned)
+        run: pip install pexpect==4.9.0
+      - name: Run Python test files
+        run: |
+          set -e
+          for t in scripts/tests/test_*.py; do
+            echo "--- $t ---"
+            python3 "$t"
+          done
+
+  shell-tests:
+    name: Shell test harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: bash -n + shellcheck on production scripts
+        run: |
+          set -e
+          for s in scripts/*.sh scripts/tests/*.sh; do
+            echo "--- $s ---"
+            bash -n "$s"
+            shellcheck "$s"
+          done
+      - name: Run shell tests
+        run: |
+          set -e
+          for t in scripts/tests/test_*.sh; do
+            echo "--- $t ---"
+            bash "$t"
+          done
+
+  coverage:
+    name: Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install rustup (per-run sha256 verification)
+        env:
+          TOOLCHAIN: stable
+        run: |
+          set -e
+          # Sidecar pattern: see build-and-test for full rationale.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install components (llvm-tools-preview)
+        run: rustup component add --toolchain stable llvm-tools-preview
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: coverage   # M7-7: dedicated cache namespace; ~/.cargo/bin/cargo-llvm-cov persists across runs
+      - name: Install cargo-llvm-cov (cached on warm runs)
+        run: cargo +stable install cargo-llvm-cov --locked
+
+      - name: Coverage (release, excluding gen_fixture binary)
+        run: |
+          cargo +stable llvm-cov \
+            --release \
+            --locked \
+            --bin yubihsm-share-converter \
+            --tests \
+            --lcov --output-path lcov.info \
+            --ignore-filename-regex '(target/.*|src/bin/gen_fixture\.rs)'
+
+      - name: Upload coverage to Coveralls
+        uses: coverallsapp/github-action@648a8eb78e6d50909eff900e4ec85cab4524a45b # v2.3.6
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          file: lcov.info
+          format: lcov
+          flag-name: rust
+          debug: true
+
+  audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install rustup (per-run sha256 verification)
+        env:
+          TOOLCHAIN: stable
+        run: |
+          set -e
+          # Sidecar pattern: see build-and-test for full rationale.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: audit   # M7-7: dedicated cache namespace; ~/.cargo/bin/cargo-audit persists across runs
+      - name: Install cargo-audit (cached on warm runs)
+        run: cargo install cargo-audit --locked
+
+      - name: Run audit
+        run: cargo audit --deny warnings

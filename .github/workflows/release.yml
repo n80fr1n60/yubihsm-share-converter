@@ -1,0 +1,174 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read   # H7-3: tighten to read-only at workflow scope; release job overrides
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false  # M7-6: never cancel an in-flight release — tag-once semantics
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: yubihsm-share-converter
+
+jobs:
+  pre-release-gate:
+    name: Pre-release gates (lint + audit)
+    runs-on: ubuntu-latest
+    # H7-3: inherits workflow-default contents: read; no override needed
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install rustup (per-run sha256 verification)
+        env:
+          TOOLCHAIN: stable
+        run: |
+          set -e
+          # Sidecar pattern: download rustup-init AND its sha256 sidecar
+          # from the same canonical origin, then verify before exec. The
+          # .sha256 file is auto-rolled by the rustup release process —
+          # no manual SHA rotation ever needed in this workflow. Trust
+          # anchor: TLS pin to static.rust-lang.org + integrity check of
+          # the downloaded binary, both fetched over `=https` + tlsv1.2.
+          # The `command -v rustup` guard removes any preinstalled rustup
+          # on host runners so the sidecar install is the one actually
+          # used; in bare containers it is a no-op.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install components (rustfmt, clippy)
+        run: rustup component add --toolchain stable rustfmt clippy
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: pre-release-gate
+      - name: Run scripts/tests/lint.sh
+        run: bash scripts/tests/lint.sh
+      - name: Install cargo-audit (cached on warm runs)
+        run: cargo install cargo-audit --locked
+      - name: Run cargo audit
+        run: cargo audit --deny warnings
+
+  build:
+    name: Build (${{ matrix.distro }})
+    needs: pre-release-gate
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # H7-1: ubuntu-26.04 deferred until the official `ubuntu:26.04` Docker
+        # image is reliably available on Docker Hub. Re-enable by adding back
+        # the matrix entry below WITH a `@sha256:<digest>` pin (per M7-2 +
+        # M7-4 Dockerfile shim).
+        # M7-2: container images pinned by sha256 digest; sync with
+        # .github/docker-pins/Dockerfile when Dependabot opens a digest-bump PR.
+        include:
+          - distro: ubuntu-22.04
+            container: "ubuntu@sha256:962f6cadeae0ea6284001009daa4cc9a8c37e75d1f5191cf0eb83fe565b63dd7"
+          - distro: ubuntu-24.04
+            container: "ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b"
+          - distro: debian-13
+            container: "debian@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da"
+      fail-fast: false
+    container: ${{ matrix.container }}
+    steps:
+      - name: Install build prerequisites
+        run: |
+          set -e
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            curl ca-certificates build-essential pkg-config git
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install rustup (per-run sha256 verification)
+        env:
+          TOOLCHAIN: stable
+        run: |
+          set -e
+          # Sidecar pattern: see pre-release-gate for full rationale.
+          # Inside this bare container, the `command -v rustup` guard
+          # is a no-op (no preinstalled rustup); the verification block
+          # below is identical to every other rust-needing job.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Run release tests
+        run: cargo test --release --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked --bin "$BIN_NAME"
+
+      - name: Stage artifacts
+        run: |
+          set -e
+          STAGE="$BIN_NAME-${GITHUB_REF_NAME}-${{ matrix.distro }}-x86_64"
+          mkdir -p "$STAGE"
+          cp "target/release/$BIN_NAME" "$STAGE/"
+          cp README.md "$STAGE/"
+          if [ -f LICENSE ]; then cp LICENSE "$STAGE/"; fi
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          echo "STAGE=$STAGE" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        with:
+          name: ${{ env.STAGE }}
+          path: |
+            ${{ env.STAGE }}.tar.gz
+            ${{ env.STAGE }}.tar.gz.sha256
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # H7-3: write-token scoped to this job only (publish release artifacts)
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v5.0.0
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          body_path: .github/RELEASE_NOTES.md
+          generate_release_notes: true
+          fail_on_unmatched_files: true

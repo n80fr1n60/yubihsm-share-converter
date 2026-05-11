@@ -1,0 +1,43 @@
+# Rust build output
+/target/
+
+# Python bytecode and test caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local editor and OS files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+*.log
+
+# Local E2E / ceremony scratch artifacts when created in the repo root
+/converted.txt
+/legacy.txt
+/legacy_shares.txt
+/imported_wrap_id.txt
+/raw_setup.log
+/wrapped_victim.bin
+/victim_pubkey.pem
+/victim_pubkey.after.pem
+/keymat-*/
+/out/
+/tmp/
+/FIX_PLAN.html
+
+# Coverage/profiling artifacts
+*.profraw
+*.profdata
+/coverage/
