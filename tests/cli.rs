@@ -775,12 +775,15 @@ fn over_determined_passes_on_clean_2_of_3() {
 
 #[test]
 fn over_determined_catches_corruption_at_byte_35() {
-    // R4-5: take the canonical 2-of-3 fixture, decode share #3, flip
-    // byte 35 (interior of the recovered AES-256 key region inside the
-    // 52-byte wrap-blob), re-encode, splice back into the input. The
-    // over-determined cross-check must fire with exit 4 and the error
-    // must name share index 3 — but MUST NOT name "byte 35" or any
-    // position-indicating digit substring (R4-5 Low residue).
+    // R4-5 + R12-C-05: take the canonical 2-of-3 fixture, decode share
+    // #3, flip byte 35 (interior of the recovered AES-256 key region
+    // inside the 52-byte wrap-blob), re-encode, splice back into the
+    // input. The over-determined cross-check must fire with exit 4 and
+    // the error must be the GENERIC "shares mismatch (one or more)"
+    // message — NEITHER the byte position NOR the failing share index
+    // is allowed to leak (R4-5 Low residue + R12-C-05 locator-drop:
+    // an adversary running repeated probes with different corrupted
+    // bytes/shares must learn NO bit beyond "at least one is bad").
     use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 
     let lines = load_canary_fixture_lines();
@@ -815,16 +818,20 @@ fn over_determined_catches_corruption_at_byte_35() {
     let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr is utf-8");
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf-8");
 
-    // Required: the error must name share index 3 and the polynomial-fit
-    // mismatch.
+    // Required (R12-C-05): the error message MUST contain the generic
+    // mismatch phrasing.
     assert!(
-        stderr.contains("share index 3 payload differs from polynomial fit"),
-        "expected share-3 polynomial-fit error; got stderr:\n{stderr}"
+        stderr.contains("over-determined cross-check FAILED") || stderr.contains("shares mismatch"),
+        "expected the generic over-determined-mismatch error; got stderr:\n{stderr}"
+    );
+    // Required: phrasing must mention "one or more" — defines the locator-
+    // drop discipline.
+    assert!(
+        stderr.contains("one or more"),
+        "expected `one or more` plural phrasing; got stderr:\n{stderr}"
     );
 
-    // Forbidden (R4-5 Low residue): the literal byte position must NOT
-    // appear in any position-indicating context. We assert NEITHER
-    // "byte 35" nor any "byte_idx" debug leak appears.
+    // Forbidden (R4-5 Low residue + R12-C-05): NO byte-position leak.
     assert!(
         !stderr.contains("byte 35"),
         "stderr leaked the byte position; got:\n{stderr}"
@@ -836,6 +843,34 @@ fn over_determined_catches_corruption_at_byte_35() {
     assert!(
         !stderr.contains("offset 35"),
         "stderr leaked the offset; got:\n{stderr}"
+    );
+
+    // Forbidden (R12-C-05): NO share-index leak. The corrupt share is
+    // index 3 (per parts[1] in the canonical fixture); the new
+    // locator-drop discipline means the message must NOT name that
+    // index. (We forbid the literal substring "share index 3" — the
+    // pre-R12 phrasing — and the bare integer in the
+    // "share <n>" context.)
+    assert!(
+        !stderr.contains("share index 3"),
+        "stderr leaked the share index (pre-R12 phrasing); got:\n{stderr}"
+    );
+    // The integer-3 alone could legitimately appear in other contexts
+    // (e.g. "3 extra share(s)" on the success path, but the success
+    // markers are not present here — we're on the exit-4 path). The
+    // load-bearing locator-drop check is the absence of "share index
+    // <integer>" and "share <integer> payload"-style phrasings.
+    assert!(
+        !stderr.contains("share 3 payload"),
+        "stderr leaked the share index via `share N payload`; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("share index 1"),
+        "stderr leaked some share index 1; got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("share index 2"),
+        "stderr leaked some share index 2; got:\n{stderr}"
     );
 
     // Forbidden: no key bytes / re-emitted shares on stdout (the
@@ -854,4 +889,364 @@ fn over_determined_catches_corruption_at_byte_35() {
         !stderr.contains("29363f04"),
         "exit-4 path must not leak the AES key prefix; got:\n{stderr}"
     );
+}
+
+// ───────────────────── R12-C-05: full-blob over-determined tests ───────
+//
+// The pre-R12 byte-wise early-return cross-check could mask LATE-byte
+// corruption under specific patterns (a wrong-byte at offset N would
+// still be caught, but the *timing* of the failure leaked N via
+// repeated invocations). The R12-C-05 rewrite collects the full
+// predicted blob first, then constant-time compares — every position is
+// folded into the verdict in constant time. The tests below cover:
+//
+//   • last-byte corruption (boundary case — pre-R12 byte-wise loop
+//     traversed all N bytes before failing here, so it caught it, but
+//     the rewrite must continue to catch it);
+//   • middle-share corruption (shares[t..n], somewhere not the first
+//     or last extra share);
+//   • multi-share corruption (two simultaneously corrupted extras;
+//     a careless rewrite that exited on the FIRST predicted-blob mismatch
+//     would still reject, but the constant-time non-short-circuit AND
+//     discipline below means EVERY extra is verified independently).
+//   • clean 5-of-8 (the over-determined check passes; 3 extras consistent).
+//
+// All four tests exercise the end-to-end CLI path via assert_cmd, so they
+// indirectly verify the production-code rewrite in src/main.rs's n > t
+// branch.
+
+/// Build a deterministic 5-of-8 share set over a known 36-byte AES-128
+/// blob. Returned as the textual T-N-base64 lines the CLI accepts. Used
+/// by the over-determined-5-of-8 tests below.
+///
+/// R12-C-05 helper: the 5-of-8 ceremony has n=8, t=5 → 3 extra shares.
+/// Disjoint-subset cross-check kicks in at n ≥ 2t = 10 so 5-of-8 takes
+/// the over-determined branch — exactly the path we need to exercise.
+fn build_5_of_8_fixture_lines() -> Vec<String> {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    let payload_len = 36usize; // AES-128 wrap blob
+    let secret: Vec<u8> = (0..payload_len as u8)
+        .map(|i| i.wrapping_mul(11) ^ 0x3C)
+        .collect();
+    // Deterministic seed so the test is reproducible byte-for-byte.
+    let mut rng = StdRng::seed_from_u64(0xC0FF_EE58);
+    let threshold: u8 = 5;
+    let n: u8 = 8;
+
+    // Generate 4 random coefficients per byte (degree = t-1 = 4).
+    let coeffs: Vec<Vec<u8>> = (0..payload_len)
+        .map(|_| {
+            (0..(threshold as usize - 1))
+                .map(|_| rng.r#gen::<u8>())
+                .collect()
+        })
+        .collect();
+
+    // Reference splitter: hand-rolled GF(2^8)/0x11D Lagrange, identical to
+    // the one used in src/main.rs's tests::legacy_split. Inlined here so
+    // tests/cli.rs doesn't need to cross the lib/bin boundary.
+    fn mul_0x11d(a: u8, b: u8) -> u8 {
+        let mut acc: u8 = 0;
+        let mut a = a;
+        let mut b = b;
+        for _ in 0..8 {
+            let mask = 0u8.wrapping_sub(b & 1);
+            acc ^= mask & a;
+            let high = a >> 7;
+            let high_mask = 0u8.wrapping_sub(high);
+            a = (a << 1) ^ (high_mask & 0x1D);
+            b >>= 1;
+        }
+        acc
+    }
+    let mut shares: Vec<(u8, Vec<u8>)> = (1..=n).map(|x| (x, vec![0u8; payload_len])).collect();
+    for (byte_idx, &s) in secret.iter().enumerate() {
+        // poly = [secret_byte, c1, c2, c3, c4]
+        let mut poly = Vec::with_capacity(threshold as usize);
+        poly.push(s);
+        for &c in &coeffs[byte_idx] {
+            poly.push(c);
+        }
+        for (x, share) in &mut shares {
+            let mut acc: u8 = 0;
+            let mut fac: u8 = 1;
+            for &coeff in &poly {
+                acc ^= mul_0x11d(fac, coeff);
+                fac = mul_0x11d(fac, *x);
+            }
+            share[byte_idx] = acc;
+        }
+    }
+
+    shares
+        .into_iter()
+        .map(|(x, payload)| {
+            let b64 = STANDARD_NO_PAD.encode(&payload);
+            format!("{threshold}-{x}-{b64}")
+        })
+        .collect()
+}
+
+/// Helper: corrupt one byte of one of the share lines in place. Returns
+/// the modified Vec. Takes a base64 string and flips byte `byte_idx` of
+/// the decoded payload; rewraps. `share_idx` is the position in `lines`
+/// (0-based).
+fn corrupt_share_byte(
+    lines: &[String],
+    share_idx: usize,
+    byte_idx: usize,
+    xor_mask: u8,
+) -> Vec<String> {
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    let mut out: Vec<String> = lines.to_vec();
+    let parts: Vec<&str> = out[share_idx].splitn(3, '-').collect();
+    assert_eq!(parts.len(), 3, "share lines must be T-N-base64");
+    let mut payload = STANDARD_NO_PAD
+        .decode(parts[2].as_bytes())
+        .expect("base64 decodes");
+    payload[byte_idx] ^= xor_mask;
+    let new_b64 = STANDARD_NO_PAD.encode(&payload);
+    out[share_idx] = format!("{}-{}-{}", parts[0], parts[1], new_b64);
+    out
+}
+
+#[test]
+fn over_determined_detects_corruption_at_byte_0() {
+    // R12-C-05: corrupt the FIRST byte of an extra share. The pre-R12
+    // byte-wise early-return loop caught this trivially; the new full-
+    // blob constant-time compare must continue to catch it. Sanity-check
+    // the simplest non-degenerate case before harder ones.
+    let lines = load_canary_fixture_lines();
+    assert_eq!(lines.len(), 3, "canonical 2-of-3 fixture");
+    // Share #3 (lines[2]) is the only extra; flip byte 0.
+    let corrupted = corrupt_share_byte(&lines, 2, 0, 0x01);
+    let stdin = format!("{}\n{}\n{}\n", corrupted[0], corrupted[1], corrupted[2]);
+    let assert = cmd()
+        .arg("--resplit")
+        .arg("--i-accept-disk-output")
+        .env("YHSC_ALLOW_DISK_STDOUT", "1")
+        .env_remove("HISTFILE")
+        .env("HISTCONTROL", "ignorespace")
+        .write_stdin(stdin)
+        .assert()
+        .code(4);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("over-determined cross-check FAILED"),
+        "byte-0 corruption must trigger the new error; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn over_determined_detects_corruption_at_last_byte() {
+    // R12-C-05: corrupt the LAST byte of an extra share. Pre-R12 the
+    // byte-wise early-return walked all N bytes before failing here —
+    // so it caught it — but the timing of the failure leaked N via
+    // repeated invocations. The new full-blob constant-time compare
+    // catches the corruption with NO position-dependent timing.
+    let lines = load_canary_fixture_lines();
+    // Decode share #3 to find payload length (= 52 for AES-256 toy
+    // fixture, but compute it instead of hard-coding).
+    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
+    let parts: Vec<&str> = lines[2].splitn(3, '-').collect();
+    let payload = STANDARD_NO_PAD
+        .decode(parts[2].as_bytes())
+        .expect("base64 decodes");
+    let last_byte = payload.len() - 1;
+    let corrupted = corrupt_share_byte(&lines, 2, last_byte, 0x80);
+    let stdin = format!("{}\n{}\n{}\n", corrupted[0], corrupted[1], corrupted[2]);
+    let assert = cmd()
+        .arg("--resplit")
+        .arg("--i-accept-disk-output")
+        .env("YHSC_ALLOW_DISK_STDOUT", "1")
+        .env_remove("HISTFILE")
+        .env("HISTCONTROL", "ignorespace")
+        .write_stdin(stdin)
+        .assert()
+        .code(4);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("over-determined cross-check FAILED"),
+        "last-byte corruption must trigger the new error; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn over_determined_detects_corruption_in_middle_share() {
+    // R12-C-05: in a 5-of-8 share set, corrupt one byte of a MIDDLE
+    // extra share (not the first extra, not the last extra). With t=5
+    // and n=8 there are 3 extras at positions [5, 6, 7]; the middle is
+    // index 6 (one-based: share #7 i.e. line index 6). Corrupt byte 17
+    // (an interior offset). The new full-blob compare must catch the
+    // corruption regardless of WHICH extra share is bad.
+    let lines = build_5_of_8_fixture_lines();
+    assert_eq!(lines.len(), 8, "5-of-8 fixture must have 8 shares");
+    // Sanity: the clean fixture passes (asserted below as
+    // over_determined_passes_clean_5_of_8).
+    let corrupted = corrupt_share_byte(&lines, 6, 17, 0x42);
+    let stdin = corrupted.join("\n") + "\n";
+    let assert = cmd()
+        .arg("--resplit")
+        .arg("--i-accept-disk-output")
+        .env("YHSC_ALLOW_DISK_STDOUT", "1")
+        .env_remove("HISTFILE")
+        .env("HISTCONTROL", "ignorespace")
+        .write_stdin(stdin)
+        .assert()
+        .code(4);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("over-determined cross-check FAILED"),
+        "middle-extra-share corruption must trigger the new error; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn over_determined_detects_multiple_corrupted_shares() {
+    // R12-C-05: in a 5-of-8 share set, corrupt TWO different extra
+    // shares simultaneously. The new full-blob compare folds every
+    // extra share's match-flag into `all_ok` via NON-short-circuit AND
+    // — so even when the first extra share is already detected as bad,
+    // the second's check still runs (constant-time discipline). A
+    // careless rewrite that did `if !first.ok() { return Err }` would
+    // silently fail this test if the SECOND corruption happened to
+    // perfectly cancel through a polynomial coincidence.
+    let lines = build_5_of_8_fixture_lines();
+    let one_corrupt = corrupt_share_byte(&lines, 5, 3, 0x55);
+    let two_corrupt = corrupt_share_byte(&one_corrupt, 7, 22, 0xAA);
+    let stdin = two_corrupt.join("\n") + "\n";
+    let assert = cmd()
+        .arg("--resplit")
+        .arg("--i-accept-disk-output")
+        .env("YHSC_ALLOW_DISK_STDOUT", "1")
+        .env_remove("HISTFILE")
+        .env("HISTCONTROL", "ignorespace")
+        .write_stdin(stdin)
+        .assert()
+        .code(4);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("over-determined cross-check FAILED"),
+        "multi-share corruption must trigger the new error; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn over_determined_passes_clean_5_of_8() {
+    // R12-C-05: the deterministic 5-of-8 fixture is clean; the
+    // over-determined cross-check must pass and the converter must
+    // re-emit shares. Counterpart to the corruption tests above:
+    // proves the constant-time compare doesn't FALSE-POSITIVE on
+    // clean inputs.
+    let lines = build_5_of_8_fixture_lines();
+    let stdin = lines.join("\n") + "\n";
+    let assert = cmd()
+        .arg("--resplit")
+        .arg("--i-accept-disk-output")
+        .env("YHSC_ALLOW_DISK_STDOUT", "1")
+        .env_remove("HISTFILE")
+        .env("HISTCONTROL", "ignorespace")
+        .write_stdin(stdin)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "[ok] over-determined cross-check passed",
+        ));
+    // Sanity: 3 extra shares (n - t = 3) and 8 emitted new-format shares.
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr is utf-8");
+    assert!(
+        stderr.contains("3 extra share(s)"),
+        "expected '3 extra share(s)' in success marker; got:\n{stderr}"
+    );
+    // Note: emitted-share count check would require parsing the new
+    // (post-resplit) wire format; that's covered separately by the
+    // canonical fixture round-trip in cli.rs. Here we only assert the
+    // over-determined check itself passes.
+}
+
+#[test]
+fn over_determined_error_message_no_byte_index() {
+    // R12-C-05 LOCATOR-DROP DISCIPLINE: corrupt one byte. The error
+    // message MUST NOT contain "byte" followed by a numeric index in
+    // any form ("byte 35", "byte 5", "byte_idx=N"). The locator-drop
+    // is what closes the partial-corruption oracle.
+    let lines = load_canary_fixture_lines();
+    let corrupted = corrupt_share_byte(&lines, 2, 12, 0x77);
+    let stdin = format!("{}\n{}\n{}\n", corrupted[0], corrupted[1], corrupted[2]);
+    let assert = cmd()
+        .arg("--resplit")
+        .arg("--i-accept-disk-output")
+        .env("YHSC_ALLOW_DISK_STDOUT", "1")
+        .env_remove("HISTFILE")
+        .env("HISTCONTROL", "ignorespace")
+        .write_stdin(stdin)
+        .assert()
+        .code(4);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr is utf-8");
+    // Forbidden: "byte <integer>" phrase anywhere in the error context.
+    // We use a tight character-window scan: find each "byte" occurrence,
+    // skip mandatory whitespace, and assert the next non-whitespace char
+    // is NOT a digit. No regex dependency needed — assertion is exact.
+    let has_byte_locator = stderr.match_indices("byte").any(|(idx, _)| {
+        let tail = &stderr[idx + "byte".len()..];
+        let mut chars = tail.chars();
+        // Skip whitespace (mandatory between "byte" and the integer).
+        let next = chars.find(|c| !c.is_whitespace());
+        next.map(|c| c.is_ascii_digit()).unwrap_or(false)
+    });
+    assert!(
+        !has_byte_locator,
+        "error message leaked a `byte <N>` locator; got:\n{stderr}"
+    );
+    // Also forbid the bare `byte_idx` debug-variable name.
+    assert!(
+        !stderr.contains("byte_idx"),
+        "error message leaked `byte_idx`; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn over_determined_error_message_no_share_index_value() {
+    // R12-C-05 LOCATOR-DROP DISCIPLINE: the corrupt share's index MUST
+    // NOT appear in the failure message. Counterpart to the byte-locator
+    // test above: an attacker probing different corruptions must learn
+    // only "one or more" — not which one.
+    let lines = load_canary_fixture_lines();
+    // Corrupt share #3 (line index 2). Then check the error does NOT
+    // name "share 3", "share index 3", "share #3", etc.
+    let corrupted = corrupt_share_byte(&lines, 2, 8, 0xAA);
+    let stdin = format!("{}\n{}\n{}\n", corrupted[0], corrupted[1], corrupted[2]);
+    let assert = cmd()
+        .arg("--resplit")
+        .arg("--i-accept-disk-output")
+        .env("YHSC_ALLOW_DISK_STDOUT", "1")
+        .env_remove("HISTFILE")
+        .env("HISTCONTROL", "ignorespace")
+        .write_stdin(stdin)
+        .assert()
+        .code(4);
+    let stderr = String::from_utf8(assert.get_output().stderr.clone()).expect("stderr is utf-8");
+    // Required: phrase "one or more" must be present (locator-drop
+    // affirmation).
+    assert!(
+        stderr.contains("one or more"),
+        "expected `one or more` phrasing; got:\n{stderr}"
+    );
+    // Forbidden: any "share <integer>"-style phrase. Per the locator-drop
+    // discipline none of "share index N", "share #N", "share N payload"
+    // are allowed.
+    for forbidden in [
+        "share index 1",
+        "share index 2",
+        "share index 3",
+        "share #3",
+        "share 3 payload",
+    ] {
+        assert!(
+            !stderr.contains(forbidden),
+            "error message leaked share-index via `{forbidden}`; got:\n{stderr}"
+        );
+    }
 }

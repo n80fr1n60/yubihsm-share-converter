@@ -1,0 +1,22 @@
+? Wrap Key
+●  List Wrap Keys (List all wrap keys stored on the YubiHSM)
+○  Get Object Properties (Get the properties of a wrap key)
+○  Generate Wrap Key (Generate a new wrap key)
+○  Import Wrap Key (Import a wrap key)
+○  Delete Wrap Key (Delete a wrap key)
+? Import Wrap Key
+●  From file
+○  From shares
+? Re-create from shares?
+? Press any key to recreate wrap key from shares...
+? Enter the number of shares to re-create the AES wrap key:
+? Enter share number 1 of 3:
+? Enter share number 2 of 3:
+? Enter share number 3 of 3:
+3 shares have been registered
+? Enter object label:
+? Import wrap key with the following metadata?
+  Key ID: 0xa5a2
+  Domains: 1
+  Capabilities: export-wrappped,import-wrapped
+Imported wrap key with ID 0xa5a2

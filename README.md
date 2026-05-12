@@ -410,6 +410,17 @@ The converter binary uses 13 distinct exit codes; the supporting scripts add a f
 > `29363f040d0a1318616e777c45424b5059a6afb4bdba8388919ee7ecf5f2fbc0`.
 > Regenerate the fixtures from a clean checkout to verify byte-for-byte.
 
+## Architecture, cryptography, and threat model
+
+For a formal write-up of the cryptographic primitives, share-line wire
+formats, and field-arithmetic anchors, see
+[`docs/CRYPTO-SPEC.md`](docs/CRYPTO-SPEC.md). For the operator-facing
+threat model — what the converter defends against, the operator
+assumptions that make those defences meaningful, and the explicit
+out-of-scope list — see [`docs/THREAT-MODEL.md`](docs/THREAT-MODEL.md).
+Vulnerability reporting and disclosure policy live in
+[`SECURITY.md`](SECURITY.md).
+
 ## License
 
 Apache-2.0, matching the upstream Yubico tools this interoperates with.

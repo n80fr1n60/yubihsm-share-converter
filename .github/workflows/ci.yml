@@ -125,7 +125,9 @@ jobs:
           rm -f rustup-init rustup-init.sha256
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Install components (rustfmt, clippy)
-        run: rustup component add --toolchain stable rustfmt clippy
+        env:
+          TOOLCHAIN: stable
+        run: rustup component add --toolchain "$TOOLCHAIN" rustfmt clippy
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Run scripts/tests/lint.sh
@@ -198,16 +200,18 @@ jobs:
           rm -f rustup-init rustup-init.sha256
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Install components (llvm-tools-preview)
-        run: rustup component add --toolchain stable llvm-tools-preview
+        env:
+          TOOLCHAIN: stable
+        run: rustup component add --toolchain "$TOOLCHAIN" llvm-tools-preview
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: coverage   # M7-7: dedicated cache namespace; ~/.cargo/bin/cargo-llvm-cov persists across runs
       - name: Install cargo-llvm-cov (cached on warm runs)
-        run: cargo +stable install cargo-llvm-cov --locked
+        run: cargo install cargo-llvm-cov --locked
 
       - name: Coverage (release, excluding gen_fixture binary)
         run: |
-          cargo +stable llvm-cov \
+          cargo llvm-cov \
             --release \
             --locked \
             --bin yubihsm-share-converter \

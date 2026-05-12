@@ -22,10 +22,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 cd "${REPO_ROOT}"
 
-echo "[lint] cargo fmt --check"
-cargo fmt --check
+# R11-C3 D5: pin Cargo.lock during lint so a stale lockfile trips the gate
+# locally before CI catches it. `cargo fmt` is a thin wrapper over rustfmt
+# and rejects the lock-pin as a subcommand argument; pass it as a top-level
+# cargo argument instead. For clippy the subcommand-level form works.
+echo "[lint] cargo fmt (lock-pinned, --check)"
+cargo --locked fmt --check
 
-echo "[lint] cargo clippy --all-targets --all-features -- -D warnings"
-cargo clippy --all-targets --all-features -- -D warnings
+echo "[lint] cargo clippy (lock-pinned, all-targets all-features, deny warnings)"
+cargo clippy --locked --all-targets --all-features -- -D warnings
 
 echo "[lint] all clean"

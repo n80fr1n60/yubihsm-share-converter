@@ -1,0 +1,162 @@
+name: Fuzz
+
+# R12-Phase-D / item #6: libFuzzer harnesses for parse + recover + resplit.
+#
+# Scheduled cron slots (Sunday, staggered):
+#   * parse    — 03:00 UTC
+#   * recover  — 04:00 UTC
+#   * resplit  — 05:00 UTC
+#
+# Each target runs for up to 50 minutes (-max_total_time=3000s) under the
+# nightly toolchain (cargo-fuzz requires nightly for sanitizer support).
+# The job is NON-BLOCKING: `continue-on-error: true` on the fuzz step
+# prevents a libFuzzer crash from failing the entire workflow. Crash
+# inputs are uploaded as artifacts for triage; persistent regressions
+# surface via subsequent runs returning the same minimised input.
+#
+# The corpus seeds in `fuzz/corpus_seed/<target>/` are committed; the
+# workflow copies them to `fuzz/corpus/<target>/` (the standard
+# cargo-fuzz corpus path) before invoking the fuzzer. A missing
+# corpus_seed directory FAILS the run (cp -r returns non-zero).
+
+on:
+  schedule:
+    - cron: '0 3 * * 0'   # Sunday 03:00 UTC — parse
+    - cron: '0 4 * * 0'   # Sunday 04:00 UTC — recover
+    - cron: '0 5 * * 0'   # Sunday 05:00 UTC — resplit
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Fuzz target to run (parse|recover|resplit|all)'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - parse
+          - recover
+          - resplit
+          - all
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false   # never cancel an in-flight 50-min run
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Fuzz (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    # Each target slot picks itself from the matrix. The cron schedule
+    # filter below maps cron expressions back to the target name. For
+    # workflow_dispatch, the input `target` selects a subset (all = no
+    # filter); cron events run the matrix entry whose schedule matches.
+    strategy:
+      matrix:
+        target: [parse, recover, resplit]
+      fail-fast: false
+    timeout-minutes: 75   # 50min fuzz + setup/teardown headroom
+    steps:
+      - name: Skip non-matching cron slot
+        # Each cron event runs the entire matrix by default; skip the
+        # entries that don't match the scheduled hour. workflow_dispatch
+        # respects the `target` input; for `all`, no entries are skipped.
+        env:
+          MATRIX_TARGET: ${{ matrix.target }}
+          DISPATCH_TARGET: ${{ inputs.target }}
+          SCHEDULE: ${{ github.event.schedule }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -e
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            if [ "$DISPATCH_TARGET" != "all" ] && [ "$DISPATCH_TARGET" != "$MATRIX_TARGET" ]; then
+              echo "Skipping $MATRIX_TARGET (workflow_dispatch target=$DISPATCH_TARGET)"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          elif [ "$EVENT_NAME" = "schedule" ]; then
+            case "$SCHEDULE" in
+              '0 3 * * 0') WANT=parse ;;
+              '0 4 * * 0') WANT=recover ;;
+              '0 5 * * 0') WANT=resplit ;;
+              *) WANT="" ;;
+            esac
+            if [ "$WANT" != "$MATRIX_TARGET" ]; then
+              echo "Skipping $MATRIX_TARGET (cron=$SCHEDULE, want=$WANT)"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+        id: route
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        if: steps.route.outputs.skip != 'true'
+      - name: Install rustup (per-run sha256 verification)
+        if: steps.route.outputs.skip != 'true'
+        env:
+          TOOLCHAIN: nightly
+        run: |
+          set -e
+          # Sidecar pattern (mirrors ci.yml): download rustup-init AND
+          # its sha256 sidecar from the same canonical origin, verify
+          # before exec. The .sha256 is auto-rolled by the rustup
+          # release process; no manual SHA rotation in this workflow.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        if: steps.route.outputs.skip != 'true'
+        with:
+          shared-key: fuzz-${{ matrix.target }}
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        if: steps.route.outputs.skip != 'true'
+        run: cargo install cargo-fuzz --locked
+      - name: Seed corpus from committed corpus_seed/
+        if: steps.route.outputs.skip != 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -e
+          # Fail-loud on missing seed directory.
+          test -d "fuzz/corpus_seed/$TARGET"
+          # Copy each seed file into the standard cargo-fuzz corpus path.
+          mkdir -p "fuzz/corpus/$TARGET"
+          cp -v "fuzz/corpus_seed/$TARGET"/* "fuzz/corpus/$TARGET"/
+          ls "fuzz/corpus/$TARGET"
+      - name: Run cargo-fuzz (${{ matrix.target }})
+        if: steps.route.outputs.skip != 'true'
+        env:
+          TARGET: ${{ matrix.target }}
+        # 50min = 3000s libFuzzer time cap. -timeout=300 = 5min per-run
+        # cap as a defence against infinite loops in a single input;
+        # libFuzzer reports each timeout but keeps going.
+        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=3000 -timeout=300
+        continue-on-error: true
+      - name: Upload crashes (if any)
+        if: steps.route.outputs.skip != 'true' && always()
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: fuzz-${{ matrix.target }}-artifacts
+          path: |
+            fuzz/artifacts/${{ matrix.target }}/
+            fuzz/corpus/${{ matrix.target }}/
+          retention-days: 30
+          if-no-files-found: ignore

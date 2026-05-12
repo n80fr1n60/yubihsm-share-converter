@@ -32,6 +32,12 @@ base64 = "0.22"
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+# R11-C2 / R11-V2-residue: dhat is the heap-allocation profiler used by the
+# `recover_makes_at_most_one_heap_alloc` regression test in src/main.rs.
+# Listed under [dev-dependencies] so it is *not* linked into release builds;
+# the matching `#[cfg(test)] #[global_allocator]` lives at the src/main.rs
+# crate root (M3 lock-in). Semver range, not exact pin (SD-9).
+dhat = "0.3"
 
 [profile.release]
 panic = "abort"

@@ -7,6 +7,10 @@
 # match the regex can't masquerade as real shares.
 #
 # Usage: _extract_shares.sh <raw-log-path>  > <legacy-shares-out>
+#
+# R12-02 parity gate: the sed/grep/awk pipeline below is exercised
+# against tests/fixtures/device-transcripts/yubihsm-setup-ksp.txt via
+# scripts/tests/test_transcript_parity.sh ("Parser 4" block).
 set -euo pipefail
 RAW=$1
 sed 's/\x1b\[[0-9;?]*[a-zA-Z]//g' "$RAW" \

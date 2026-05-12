@@ -66,8 +66,15 @@ fi
 # operator can't dismiss the mismatch as a case-only difference.
 EXPECTED_WRAP_ID=$(tr -d '[:space:]' < "$EXPECTED_FILE" | tr 'A-F' 'a-f')
 
+# R12-02 parity gate: this awk extractor (column-anchored $4 ==
+# "wrap-key") is exercised against
+# tests/fixtures/device-transcripts/yubihsm-shell-list-objects.txt via
+# scripts/tests/test_transcript_parity.sh ("Parser 5" block). The
+# post-R10-L2-hotfix column anchor rejects the foil auth-key row whose
+# LABEL contains the substring "wrap-key" (regression guard, see also
+# scripts/tests/test_verify_id_case.sh case 6).
 ALL_WRAP_IDS=$(shell -a list-objects 2>/dev/null \
-    | awk -F'[, ]+' '/^wrap-key,/ {print $2}' \
+    | awk -F'[, ]+' '$4 == "wrap-key" {print $2}' \
     | tr 'A-F' 'a-f')
 # v2 fix: `grep -c .` returns exit 1 on zero matches; under `set -euo pipefail`
 # that aborts the script with rc=1 BEFORE the explicit `exit 7` below can fire.
@@ -93,6 +100,10 @@ echo "[verify] using manager-imported wrap-key $WRAP_ID (matches $EXPECTED_FILE)
 # clearly-formatted FAILED banner with both expected/actual ids and the
 # tail of the tool's own diagnostics. Exit 9 is distinct from existing 1/3/4/5
 # and the new 6/7/8 above.
+#
+# R12-02 parity gate: the success-vs-failure shapes consumed below are
+# captured in tests/fixtures/device-transcripts/yubihsm-shell-put-wrapped-{ok,authfail}.txt;
+# see scripts/tests/test_transcript_parity.sh "Parser 6" block.
 echo "[verify] put-wrapped $WRAPPED with $WRAP_ID"
 PUT_LOG=${OUT_DIR}/put_wrapped.log
 if ! shell -a put-wrapped --wrap-id "$WRAP_ID" --in "$WRAPPED" >"$PUT_LOG" 2>&1; then

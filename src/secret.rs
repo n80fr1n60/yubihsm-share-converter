@@ -106,6 +106,14 @@ impl Secret {
             defused: false,
         };
         #[cfg(target_os = "linux")]
+        // SAFETY: `ptr` is non-null (checked above; `handle_alloc_error`
+        // diverges on null), `cap` is a positive page-multiple by
+        // construction (`div_ceil(page) * page`), and `MADV_DONTDUMP` is
+        // sound on any page-aligned region — it only flips a per-VMA
+        // flag, never writes through `ptr`. The pre-3.4 EINVAL branch is
+        // recovered from in-band; non-EINVAL errors panic and the
+        // `AllocGuard` (still armed at this point) frees `ptr` on the
+        // unwind path.
         unsafe {
             // MADV_DONTDUMP excludes these pages from any kernel coredump.
             // v4: pre-3.4 kernels return EINVAL — warn-once and continue,
@@ -148,14 +156,6 @@ impl Secret {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 
-    /// Mutably borrow the written prefix of the buffer.
-    #[allow(dead_code)]
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // SAFETY: see as_slice; the &mut self lifetime makes the borrow
-        // exclusive.
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-
     /// Append `src` to the buffer. Panics if the new length would exceed
     /// the caller-supplied `cap_hint`. The page-rounded `cap` is
     /// deliberately not exposed as extra capacity.
@@ -178,6 +178,14 @@ impl Secret {
     /// Current logical length.
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// `true` if no bytes have been written via `extend_from_slice` yet.
+    /// Companion to `len()` so the `clippy::len_without_is_empty` lint
+    /// stays quiet now that `Secret` is library-public (R11/C3).
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     /// Truncate the logical length. The dropped bytes remain in the
@@ -227,6 +235,11 @@ impl Drop for Secret {
 
 fn page_size() -> usize {
     #[cfg(target_os = "linux")]
+    // SAFETY: `libc::sysconf` with a compile-time constant key
+    // (`_SC_PAGESIZE`) is a pure POSIX query — it neither dereferences
+    // pointers nor touches process state. The cast to `usize` is safe
+    // because `_SC_PAGESIZE` returns a positive long on every supported
+    // platform (Linux returns 4096 or 65536).
     unsafe {
         libc::sysconf(libc::_SC_PAGESIZE) as usize
     }
@@ -305,6 +318,14 @@ mod tests {
         <Secret as NotClone>::_check();
     }
 
+    // R12-Phase-D / item #8: this test allocates a page-aligned buffer
+    // via `std::alloc::alloc` and immediately panics with the
+    // `AllocGuard` armed, exercising the panic-unwind dealloc path.
+    // Under miri the test is sound, but the panic-unwind plus the
+    // explicit raw `alloc(layout)` make it visibly different from
+    // production code in miri's borrow-tracking model — gate it out so
+    // the miri job stays focused on the algorithmic kernels.
+    #[cfg(not(miri))]
     #[test]
     #[should_panic(expected = "synthetic panic between alloc and Secret literal")]
     fn madvise_panic_does_not_leak_alloc() {

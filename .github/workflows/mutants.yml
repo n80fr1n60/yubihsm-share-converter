@@ -1,0 +1,181 @@
+name: Mutants
+
+# R12-Phase-D / item #3: cargo-mutants weekly cron — non-blocking on PRs.
+#
+# cargo-mutants synthesises small mutations of the production source
+# (replace function bodies with `Default::default()`, swap `>` for
+# `>=`, etc.) and verifies that the test suite catches each one. A
+# mutation that survives = a gap in test coverage that a real bug
+# could exploit.
+#
+# Schedule: Monday 06:00 UTC, plus workflow_dispatch for manual runs.
+# The job opens a GitHub Issue if the kill-ratio dips below the 95%
+# absolute floor (LOCKED at R12-v2-residue). The Issue is the
+# regression alert; the CI run itself remains non-blocking so a
+# transient flaky test cannot wedge the PR pipeline.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # Monday 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write    # required to open the regression Issue on dip
+
+concurrency:
+  group: mutants-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false   # never cancel an in-flight mutants run
+
+env:
+  CARGO_TERM_COLOR: always
+  KILL_RATIO_FLOOR: '0.95'    # R12-v2-residue lock: 95% absolute floor
+
+jobs:
+  mutants:
+    name: cargo-mutants (weekly)
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # mutants can run for hours; cap at 6h
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install rustup (per-run sha256 verification)
+        env:
+          TOOLCHAIN: stable
+        run: |
+          set -e
+          # Sidecar pattern (mirrors ci.yml): download rustup-init AND
+          # its sha256 sidecar from the same canonical origin, verify
+          # before exec. No manual SHA rotation needed.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: mutants
+      - name: Install cargo-mutants
+        run: cargo install cargo-mutants --locked
+      - name: Run cargo-mutants
+        # --in-place: mutate the working tree (default; cargo-mutants
+        #             reverts each mutation after testing).
+        # --no-shuffle: deterministic mutation order for reproducible
+        #             regression reports.
+        # --timeout 60: per-mutation test timeout in seconds.
+        # --colors never: clean output for issue body parsing.
+        # --jobs 2: bounded parallelism; the test suite has parallel-
+        #          sensitive tests (dhat heap-alloc check), so we keep
+        #          this low.
+        # -- --release --locked: cargo test args. Release matches the
+        #                       production profile that gates the
+        #                       project's other CI; --locked is the
+        #                       supply-chain anchor.
+        id: run-mutants
+        run: |
+          set -e
+          mkdir -p mutants-out
+          # Run mutants; capture exit so a single missed mutant doesn't
+          # kill the job (we want to compute the ratio either way).
+          set +e
+          cargo mutants \
+            --in-place \
+            --no-shuffle \
+            --timeout 60 \
+            --colors never \
+            --jobs 2 \
+            --output mutants-out \
+            -- --release --locked
+          rc=$?
+          set -e
+          echo "mutants exit code: $rc"
+          # mutants emits caught.txt / missed.txt / timeout.txt /
+          # unviable.txt in the output dir. Compute the kill ratio.
+          caught=$(wc -l < mutants-out/mutants.out/caught.txt 2>/dev/null || echo 0)
+          missed=$(wc -l < mutants-out/mutants.out/missed.txt 2>/dev/null || echo 0)
+          timeout_=$(wc -l < mutants-out/mutants.out/timeout.txt 2>/dev/null || echo 0)
+          # Unviable mutations (those that fail to compile) are
+          # excluded from the ratio — they're not real coverage gaps.
+          total=$((caught + missed + timeout_))
+          if [ "$total" -eq 0 ]; then
+            {
+              echo "kill_ratio=1.0"
+              echo "caught=0"
+              echo "missed=0"
+              echo "timeout=0"
+            } >> "$GITHUB_OUTPUT"
+          else
+            kill_ratio=$(awk "BEGIN {printf \"%.4f\", ($caught + $timeout_) / $total}")
+            {
+              echo "kill_ratio=$kill_ratio"
+              echo "caught=$caught"
+              echo "missed=$missed"
+              echo "timeout=$timeout_"
+            } >> "$GITHUB_OUTPUT"
+          fi
+      - name: Upload mutants output
+        if: always()
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: mutants-out
+          path: mutants-out/
+          retention-days: 90
+      - name: Check kill-ratio floor
+        env:
+          KR: ${{ steps.run-mutants.outputs.kill_ratio }}
+          FLOOR: ${{ env.KILL_RATIO_FLOOR }}
+        run: |
+          set -e
+          # Bash float compare: awk returns 1 on KR < FLOOR, 0 otherwise.
+          dip=$(awk -v kr="$KR" -v fl="$FLOOR" 'BEGIN { print (kr+0 < fl+0) ? "1" : "0" }')
+          echo "Kill ratio: $KR (floor: $FLOOR; dip=$dip)"
+          if [ "$dip" = "1" ]; then
+            echo "REGRESSION: kill ratio $KR < floor $FLOOR" >&2
+            echo "kill_ratio_below_floor=1" >> "$GITHUB_ENV"
+          else
+            echo "kill_ratio_below_floor=0" >> "$GITHUB_ENV"
+          fi
+      - name: Open regression Issue (kill ratio below floor)
+        if: env.kill_ratio_below_floor == '1'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const kr = '${{ steps.run-mutants.outputs.kill_ratio }}';
+            const floor = '${{ env.KILL_RATIO_FLOOR }}';
+            const caught = '${{ steps.run-mutants.outputs.caught }}';
+            const missed = '${{ steps.run-mutants.outputs.missed }}';
+            const timeout = '${{ steps.run-mutants.outputs.timeout }}';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              '## cargo-mutants kill-ratio regression',
+              '',
+              `Weekly mutation-testing run dipped below the locked 95% floor.`,
+              '',
+              `| Metric | Value |`,
+              `|---|---|`,
+              `| Kill ratio | ${kr} |`,
+              `| Floor (R12-v2-residue) | ${floor} |`,
+              `| Caught | ${caught} |`,
+              `| Missed | ${missed} |`,
+              `| Timeout | ${timeout} |`,
+              '',
+              `Inspect the missed-mutants list in the run artifact "mutants-out": ${runUrl}`,
+              '',
+              `_Auto-opened by .github/workflows/mutants.yml._`,
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `cargo-mutants regression: kill ratio ${kr} < ${floor}`,
+              body,
+              labels: ['mutation-testing', 'regression'],
+            });

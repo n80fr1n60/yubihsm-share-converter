@@ -1,0 +1,134 @@
+name: Reproducible Build
+
+# R12-Phase-D / item #7: heavy reproducible-build verification.
+#
+# Builds the release binary on two distinct Ubuntu runners, asserts
+# byte-identical sha256 across runners. The build is fully hermetic:
+#
+#   * SOURCE_DATE_EPOCH = commit time (HEAD's authordate, seconds-
+#     since-epoch). Pins the embedded build timestamp so the rustc
+#     output doesn't drift across runs.
+#   * `cargo build --frozen --locked` against the committed `vendor/`
+#     directory + `.cargo/config.toml`. No network access; no
+#     registry-cache variance; the source tree is the SOLE input.
+#   * Matrix over `ubuntu-22.04` + `ubuntu-24.04` to catch
+#     toolchain/host-library drift in the linker output.
+#
+# A divergence between the two runners' sha256 of the release binary
+# is a hard FAIL — it means the binary is non-reproducible and a third
+# party cannot independently verify the released bytes.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reprobuild-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  BIN_NAME: yubihsm-share-converter
+
+jobs:
+  build:
+    name: Reproducible build (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        runner: [ubuntu-22.04, ubuntu-24.04]
+      fail-fast: false
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install rustup (per-run sha256 verification)
+        env:
+          TOOLCHAIN: stable
+        run: |
+          set -e
+          # Sidecar pattern (mirrors ci.yml): download rustup-init AND
+          # its sha256 sidecar from the same canonical origin, verify
+          # before exec.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: reprobuild-${{ matrix.runner }}
+      - name: Pin SOURCE_DATE_EPOCH from HEAD commit time
+        run: |
+          set -e
+          # `git log -1 --format=%ct HEAD` returns the commit timestamp
+          # in seconds-since-epoch (UTC). Capturing it once and exporting
+          # via GITHUB_ENV makes it visible to every subsequent step,
+          # including the cargo build.
+          sde="$(git log -1 --format=%ct HEAD)"
+          echo "SOURCE_DATE_EPOCH=$sde" >> "$GITHUB_ENV"
+          echo "Pinned SOURCE_DATE_EPOCH=$sde"
+      - name: Build (release, frozen, locked, vendored)
+        run: |
+          set -e
+          # --frozen: assert Cargo.lock is up-to-date with Cargo.toml
+          #           (refuse to update); equivalent to --locked
+          #           --offline. With the committed vendor/ directory
+          #           in place, the build has no network access.
+          # --locked: assert Cargo.lock is honoured; refuse to update
+          #          even if a newer compatible version is available.
+          cargo build --release --locked --frozen --bin "$BIN_NAME"
+      - name: Compute sha256 of release binary
+        run: |
+          set -e
+          sha256sum "target/release/$BIN_NAME" > "sha256-${{ matrix.runner }}.txt"
+          cat "sha256-${{ matrix.runner }}.txt"
+      - name: Upload sha256
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: sha256-${{ matrix.runner }}
+          path: sha256-${{ matrix.runner }}.txt
+          retention-days: 30
+
+  compare:
+    name: Compare sha256 across runners
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
+        with:
+          path: sha256/
+      - name: Diff sha256 files (must match byte-identical)
+        run: |
+          set -e
+          # Each downloaded artifact lands in `sha256/<artifact-name>/`.
+          # We compare the bare hex hashes (cut to the first column) so a
+          # different file PATH inside the sha256sum output doesn't false-
+          # positive a mismatch.
+          file_22="sha256/sha256-ubuntu-22.04/sha256-ubuntu-22.04.txt"
+          file_24="sha256/sha256-ubuntu-24.04/sha256-ubuntu-24.04.txt"
+          test -f "$file_22"
+          test -f "$file_24"
+          h22="$(cut -d ' ' -f1 "$file_22")"
+          h24="$(cut -d ' ' -f1 "$file_24")"
+          echo "ubuntu-22.04 sha256: $h22"
+          echo "ubuntu-24.04 sha256: $h24"
+          if [ "$h22" != "$h24" ]; then
+            echo "FAIL: release binary is NOT byte-identical across runners" >&2
+            exit 1
+          fi
+          echo "PASS: release binary is byte-identical across runners"

@@ -40,35 +40,22 @@
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
-// ── inline replica of legacy::* (kept here so this bin doesn't depend on
-//    the main crate's private legacy module) ─────────────────────────────
-
-fn xtimes(p: u8) -> u8 {
-    let high = p >> 7;
-    let mask = 0u8.wrapping_sub(high);
-    (p << 1) ^ (mask & 0x1D)
-}
-
-fn build_tables() -> ([u8; 256], [u8; 256]) {
-    let mut exp = [0u8; 256];
-    let mut log = [0u8; 256];
-    let mut tmp: u8 = 1;
-    for (power, exp_slot) in exp.iter_mut().enumerate().take(255) {
-        *exp_slot = tmp;
-        log[tmp as usize] = power as u8;
-        tmp = xtimes(tmp);
-    }
-    (exp, log)
-}
-
-fn mul(exp: &[u8; 256], log: &[u8; 256], a: u8, b: u8) -> u8 {
-    if a == 0 || b == 0 {
-        return 0;
-    }
-    let la = log[a as usize] as usize;
-    let lb = log[b as usize] as usize;
-    exp[(la + lb) % 255]
-}
+// R11-C3 R10-M2: drop the inline replica of legacy::* and import the
+// canonical implementations from `yubihsm_share_converter::legacy`
+// instead. The R11/C3 module split made `legacy` `pub`, so this bin no
+// longer needs a fork-and-trim copy. `legacy::mul` is the constant-time
+// branchless Russian-peasant introduced in R11/C2; the previous inline
+// version was the table-walk form. Both produce identical outputs over
+// the same field (GF(2^8) / 0x11D), so the regenerated fixtures are
+// byte-identical to the committed ones — exhaustively verified by
+// `legacy::tests::mul_branchless_matches_reference_exhaustive`.
+//
+// R12-C-04: the `Tables` struct + `build_tables` constructor were
+// dropped from production code. `legacy::mul` now takes (a, b) directly
+// — no &Tables arg, no precomputed log/exp tables. The output bytes
+// over poly 0x11D are unchanged; this fixture generator's output
+// remains byte-identical to the committed `tests/data/toy_2of3*.txt`.
+use yubihsm_share_converter::legacy::mul;
 
 fn main() {
     // M-C3: parameterise on AES key length. Default (no arg) keeps the
@@ -99,8 +86,6 @@ fn main() {
         .collect();
     assert_eq!(secret.len(), payload_len);
 
-    let (exp, log) = build_tables();
-
     // 2-of-3: degree-1 polys → 1 random coefficient per byte.
     let threshold: u8 = 2;
     let n: u8 = 3;
@@ -114,11 +99,12 @@ fn main() {
         let poly = [s, c1];
         for (x, share) in &mut shares {
             // f(x) = c0 + c1*x in GF(2^8)/0x11D
+            // R12-C-04: mul is now (a, b) → u8, no &Tables arg.
             let mut acc: u8 = 0;
             let mut fac: u8 = 1;
             for &coeff in &poly {
-                acc ^= mul(&exp, &log, fac, coeff);
-                fac = mul(&exp, &log, fac, *x);
+                acc ^= mul(fac, coeff);
+                fac = mul(fac, *x);
             }
             share[byte_idx] = acc;
         }

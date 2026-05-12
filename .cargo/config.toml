@@ -1,0 +1,20 @@
+# R12-Phase-D / item #7: vendored cargo sources for reproducible builds.
+#
+# The `cargo vendor` command produced `vendor/` and printed this config
+# stanza; we commit it so reproducible-build CI can run `cargo build
+# --frozen --locked` against the same byte-identical sources on every
+# runner. The `replace-with = "vendored-sources"` redirect tells cargo
+# to use the local `vendor/` directory in place of `crates-io`, which
+# eliminates network access and registry-cache variance from the build
+# inputs.
+#
+# A `cargo update` workflow that picks up new dependency versions MUST
+# also re-run `cargo vendor` to refresh `vendor/`; otherwise `cargo
+# build --frozen` will fail because the Cargo.lock no longer matches
+# the vendored sources.
+
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "vendor"

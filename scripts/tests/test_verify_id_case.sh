@@ -76,17 +76,22 @@ cat > "$STUB_DIR/yubihsm-shell" <<'STUB'
 #   anything else         → exit 0 silently.
 for arg in "$@"; do
     if [ "$arg" = "list-objects" ]; then
-        printf 'authentication-key, 0x0001, sequence: 0\n'
+        # R11-hotfix: emit real yubihsm-shell list-objects format:
+        # `id: <ID>, type: <TYPE>, algo: <ALGO>, sequence: 0, label: <LABEL>`
+        # The type token is at awk field $4 (not $1). The post-hotfix awk
+        # `$4 == "wrap-key" {print $2}` extracts the genuine wrap-key id
+        # from $2. Real-device output was the load-bearing miss that the
+        # column-1-anchored R10-L2 stub failed to model.
+        printf 'id: 0x0001, type: authentication-key, algo: aes128-yubico-authentication, sequence: 0, label: DEFAULT AUTHKEY\n'
         if [ "${YHSM_EMIT_FOIL_LABEL:-0}" = "1" ]; then
-            # R10-L2 foil: auth-key row with label that CONTAINS the
-            # substring "wrap-key". Pre-fix awk `/wrap-key/` would match
-            # this row and emit `0xDEAD` (the auth-key id) alongside the
-            # genuine wrap-key id, blowing N_WRAP to 2 → exit 7.
-            # Post-fix awk `/^wrap-key,/` ignores this row because it
-            # starts with "authentication-key,", not "wrap-key,".
-            printf 'authentication-key, 0xDEAD, sequence: 0, label: my-wrap-key-label\n'
+            # Foil: auth-key row whose label CONTAINS the substring "wrap-key".
+            # Pre-fix awk `/wrap-key/` would match this row and emit `0xDEAD`,
+            # blowing N_WRAP to 2 → exit 7. Post-fix awk `$4 == "wrap-key"`
+            # ignores this row because its $4 is "authentication-key", not
+            # "wrap-key" — the label-substring trap cannot reach $4.
+            printf 'id: 0xDEAD, type: authentication-key, algo: aes128-yubico-authentication, sequence: 0, label: my-wrap-key-label\n'
         fi
-        printf 'wrap-key, %s, sequence: 0\n' "$YHSM_LIST_WRAP_ID"
+        printf 'id: %s, type: wrap-key, algo: aes256-ccm-wrap, sequence: 0, label: Wrap key\n' "$YHSM_LIST_WRAP_ID"
         exit 0
     fi
     if [ "$arg" = "put-wrapped" ]; then

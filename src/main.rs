@@ -32,12 +32,25 @@
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use clap::Parser;
 
-mod secret;
 use secret::Secret;
+use yubihsm_share_converter::parse::{parse_legacy_share, LegacyShare};
+use yubihsm_share_converter::{legacy, resplit, secret};
+
+// R11-V2-residue (M3 lock-in): swap in dhat's allocator under `#[cfg(test)]`
+// so the `recover_makes_at_most_one_heap_alloc` regression test can observe
+// per-call heap-block deltas. The `#[cfg(test)]` gate guarantees the
+// allocator is NEVER linked into release builds — the dhat crate itself is
+// listed under `[dev-dependencies]` so it cannot reach release-side code at
+// all. The allocator MUST be defined at the crate root (not inside a leaf
+// module, not inside `mod tests`) for the `#[global_allocator]` attribute
+// to register before `main()` runs.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: dhat::Alloc = dhat::Alloc;
 
 // ───────────────────────────── H3: CLI surface ──────────────────────────
 //
@@ -272,441 +285,13 @@ fn lock_down_process() {
 fn lock_down_process() { /* honoured the override above */
 }
 
-// ───────────────────────────── resplit (AES poly 0x11B) ────────────────
-//
-// R9-H3: hand-rolled Shamir split over GF(2^8) with the AES/Rijndael
-// reduction polynomial 0x11B (matches what yubihsm-manager's parser
-// expects; equivalent to vsss-rs's Gf256 default). Replaces the
-// vsss-rs::Gf256::split_array call at the resplit site so all
-// intermediate buffers (polynomial coefficients + per-share Y
-// accumulators) live in zeroize-controlled storage.
-//
-// Layout: independent random coefficients per byte position. For each
-// byte b of the secret blob, build a degree-(threshold-1) polynomial
-// p(x) = b + c_1 x + c_2 x^2 + ... + c_{t-1} x^{t-1} with c_i drawn
-// from OsRng; emit shares (i, p(i)) for i in 1..=n. Caller is
-// responsible for serialising the share-index byte + the per-byte
-// Y-evaluation into the textual format yubihsm-manager accepts.
-//
-// We store the x-coordinate in the Secret for layout simplicity. The
-// only post-construction read is the M11 [1..=n] range guard in the
-// drain loop; the x-coordinate is public per Shamir design, so this
-// read carries no secret-residue concern.
-mod resplit {
-    use crate::secret::Secret;
-    use rand::Rng;
-    use zeroize::Zeroize; // R9-v2 B5: needed for buf.zeroize() below.
-
-    /// Multiply-by-x in GF(2^8) reducing modulo 0x11B (AES/Rijndael poly).
-    /// Mirrors the legacy::xtimes idiom but uses 0x1B as the reduction
-    /// constant instead of 0x1D.
-    #[inline]
-    fn xtimes_aes(p: u8) -> u8 {
-        let high = p >> 7;
-        let mask = 0u8.wrapping_sub(high); // 0x00 or 0xFF
-        (p << 1) ^ (mask & 0x1B)
-    }
-
-    /// GF(2^8) multiply using the AES reduction. No tables — Russian-peasant
-    /// 8-iteration unroll. R9-v2 M-8 / R9-v3 L-2 tightened framing: constant
-    /// in *number of operations* (always 8 iterations); the conditional XOR
-    /// branches on the bit pattern of the *second* argument `b`. In the
-    /// production `eval_poly` call shape (below), `b` is always the public
-    /// share x-coordinate, NOT a secret coefficient — so the branch leaks
-    /// only public bits. Even if the second argument were secret, Shamir
-    /// secret sharing's security guarantee is information-theoretic, not
-    /// timing-side-channel-sensitive — there is no IND-CCA bound to defend.
-    /// The function is O(8) per call: for a 36-byte payload × 9 shares × 5
-    /// threshold ≈ 1620 multiplies per resplit, ≤ 1 ms total.
-    #[inline]
-    pub(super) fn mul_aes(a: u8, b: u8) -> u8 {
-        let mut result = 0u8;
-        let mut a = a;
-        let mut b = b;
-        for _ in 0..8 {
-            if b & 1 != 0 {
-                result ^= a;
-            }
-            a = xtimes_aes(a);
-            b >>= 1;
-        }
-        result
-    }
-
-    /// Evaluate the polynomial defined by `[secret_byte, coeffs[0], coeffs[1], ...]`
-    /// at x using Horner's rule. `coeffs.len() == threshold - 1`.
-    #[inline]
-    fn eval_poly(secret_byte: u8, coeffs: &[u8], x: u8) -> u8 {
-        // Horner: p(x) = ((c_{t-1} * x + c_{t-2}) * x + ... + c_1) * x + secret_byte
-        let mut acc = 0u8;
-        for &c in coeffs.iter().rev() {
-            acc = mul_aes(acc, x) ^ c;
-        }
-        mul_aes(acc, x) ^ secret_byte
-    }
-
-    /// Shamir split. Returns `Vec<Secret>` — one Secret per share, where
-    /// share i holds [i, p_0(i), p_1(i), ..., p_{L-1}(i)] for L = secret.len().
-    /// The per-byte coefficient Secret is RE-ALLOCATED each byte iteration
-    /// (B1: Secret has no `clear()`; reallocation + Drop is the API-shaped
-    /// way to discard old coefficients between byte positions).
-    ///
-    /// Caller (the resplit branch in main()) consumes the returned Vec by
-    /// value via `.drain(..)` so each per-share Secret is Drop'd (and
-    /// zeroized) on its way out (B3).
-    ///
-    /// R9-H3 SAFETY: all secret-bearing storage is `Secret`-owned, which
-    /// means page-aligned + MADV_DONTDUMP'd + zeroed-on-drop. There is no
-    /// `Vec<u8>` or `[u8; N]` stack-resident transient that holds a share
-    /// Y-byte without being zeroized on the same function exit. The
-    /// `share_x` stack value (1..=n) is a *public* Shamir x-coordinate and
-    /// is information-theoretically irrelevant; it is not protected.
-    pub fn split(secret: &[u8], threshold: u8, n: u8) -> Result<Vec<Secret>, String> {
-        if !(2..=31).contains(&threshold) {
-            return Err(format!(
-                "threshold {threshold} outside legal range [2..=31]"
-            ));
-        }
-        if !(threshold..=255).contains(&n) {
-            return Err(format!(
-                "share count n={n} outside legal range [{threshold}..=255]"
-            ));
-        }
-        if secret.is_empty() {
-            return Err("cannot split empty secret".into());
-        }
-        let mut rng = rand::rngs::OsRng;
-        // Per-share output: each Secret holds [idx_byte | y_0 | y_1 | ... | y_{L-1}].
-        // idx_byte is the public Shamir x-coordinate (1..=n); the y's are secret.
-        let mut shares: Vec<Secret> = (1..=n)
-            .map(|idx| {
-                let mut s = Secret::with_capacity(1 + secret.len());
-                s.extend_from_slice(&[idx]); // share_x = idx; written once.
-                s
-            })
-            .collect();
-        // For each byte position of the secret, freshly allocate a Secret-
-        // backed coefficient buffer, draw threshold-1 random bytes from
-        // OsRng, evaluate the polynomial at each share's x-coordinate, and
-        // append the y-byte to that share's Secret. The coeffs Secret is
-        // re-bound on every iteration; the prior binding's Drop runs at
-        // shadow-rebind and zeroizes the old coefficient bytes (B1).
-        for &secret_byte in secret.iter() {
-            // R9-v2 B1: re-allocate; previous coeffs Secret Drops here.
-            let mut coeffs = Secret::with_capacity((threshold - 1) as usize);
-            for _ in 0..(threshold - 1) {
-                let mut buf = [0u8; 1];
-                rng.fill(&mut buf);
-                coeffs.extend_from_slice(&buf);
-                buf.zeroize();
-            }
-            // Evaluate at each share index. share_x is recomputed from the
-            // iteration index — public per design — instead of read back
-            // from share.as_slice()[0] (M-6 simplification).
-            for (idx0, share) in shares.iter_mut().enumerate() {
-                let share_x = (idx0 as u8) + 1;
-                let y = eval_poly(secret_byte, coeffs.as_slice(), share_x);
-                share.extend_from_slice(&[y]);
-            }
-            // coeffs Secret Drops here at end of iteration body → zeroize.
-        }
-        Ok(shares)
-    }
-}
-
-// ───────────────────────────── legacy field ─────────────────────────────
-//
-// GF(2^8) with reduction polynomial x^8 + x^4 + x^3 + x^2 + 1 (low byte
-// 0x1D). Implemented exactly the same way as rusty-secrets 0.0.2 so that
-// share bytes round-trip. Tables are generated at startup; they are not
-// secret, so a const-time implementation isn't needed for the lookup.
-mod legacy {
-    pub struct Tables {
-        exp: [u8; 256], // exp[i] = generator^i, exp[0] = 1, exp[255] wraps to 1
-        log: [u8; 256], // log[exp[i]] = i; log[0] is undefined (left 0)
-    }
-
-    /// Multiply-by-x, reducing modulo 0x11D when the high bit is set.
-    #[inline]
-    fn xtimes(p: u8) -> u8 {
-        let high = p >> 7;
-        let mask = 0u8.wrapping_sub(high); // 0x00 or 0xFF
-        (p << 1) ^ (mask & 0x1D)
-    }
-
-    pub fn build_tables() -> Tables {
-        let mut t = Tables {
-            exp: [0u8; 256],
-            log: [0u8; 256],
-        };
-        let mut tmp: u8 = 1;
-        for power in 0..255 {
-            t.exp[power] = tmp;
-            t.log[tmp as usize] = power as u8;
-            tmp = xtimes(tmp);
-        }
-        t
-    }
-
-    #[inline]
-    pub fn mul(t: &Tables, a: u8, b: u8) -> u8 {
-        if a == 0 || b == 0 {
-            return 0;
-        }
-        let la = t.log[a as usize] as usize;
-        let lb = t.log[b as usize] as usize;
-        t.exp[(la + lb) % 255]
-    }
-
-    /// a^-1 = a^254 in GF(256). Errors if a == 0.
-    #[inline]
-    pub fn inv(t: &Tables, a: u8) -> Result<u8, &'static str> {
-        if a == 0 {
-            return Err("inverse of zero in GF(2^8)");
-        }
-        let la = t.log[a as usize] as usize;
-        Ok(t.exp[(255 - la) % 255])
-    }
-
-    /// Lagrange interpolation at x = 0 over the legacy field.
-    ///
-    /// R9-H2: accept an iterator-producing closure rather than a slice of
-    /// (xi, yi) tuples. The legacy field requires two passes (Phase-1
-    /// validation then Phase-3 Lagrange evaluation); a single-shot
-    /// Iterator is consumed in one pass, so the API takes a closure that
-    /// produces a FRESH iterator each call. This pattern is borrowck-
-    /// friendly (no need to hold a borrowed copy across passes) and
-    /// avoids any heap allocation in the caller — the previous
-    /// `&[(u8, u8)]` shape forced callers (notably `recover()`) to
-    /// materialise per-byte points into a `Vec<(u8, u8)>` that held raw
-    /// share Y-bytes and was dropped without scrubbing every loop.
-    ///
-    /// Trait bound: `Fn() -> impl Iterator<Item = (u8, u8)>`. The closure
-    /// must be callable multiple times because the function performs two
-    /// independent passes (Phase 1 + Phase 3). `FnOnce` would be a footgun.
-    ///
-    /// xs holds Shamir x-coordinates (public per design — they appear
-    /// verbatim in the T-N-base64 share-line format); stack residue on
-    /// panic-unwind is information-theoretically irrelevant and accepted.
-    /// Under panic = "abort" (Cargo.toml release profile) the unwind path
-    /// doesn't exist at all.
-    ///
-    ///   L(0) = Σ y_i · Π_{j≠i} (-x_j) / (x_i - x_j)
-    ///        = Σ y_i · Π_{j≠i}  x_j  / (x_i ⊕ x_j)     [char 2: -a = a]
-    pub fn interp_at_zero<F, I>(t: &Tables, points: F) -> Result<u8, String>
-    where
-        F: Fn() -> I,
-        I: Iterator<Item = (u8, u8)>,
-    {
-        // Phase 1: x_i == 0 + duplicate-x rejection. Re-create the iterator;
-        // collect ONLY the x-coordinates into a stack-resident u8 array
-        // bounded by the threshold range [2..31] enforced upstream. The
-        // bound permits a fixed-size [u8; 32] scratch so even the x-list
-        // never touches the heap.
-        let mut xs = [0u8; 32];
-        let mut n = 0usize;
-        for (xi, _yi) in points() {
-            if xi == 0 {
-                return Err("share index 0 is invalid in legacy field".into());
-            }
-            if n >= xs.len() {
-                return Err(format!("interpolation set exceeds {}-share cap", xs.len()));
-            }
-            if xs[..n].contains(&xi) {
-                return Err(format!("duplicate x={xi} in interpolation set"));
-            }
-            xs[n] = xi;
-            n += 1;
-        }
-        // Phase 3: Lagrange evaluation. Re-create the iterator; pair each
-        // (xi, yi) with the OTHER xj values from `xs[..n]`.
-        let mut sum: u8 = 0;
-        for (i, (xi, yi)) in points().enumerate() {
-            let mut num: u8 = 1;
-            let mut den: u8 = 1;
-            for (j, &xj) in xs[..n].iter().enumerate() {
-                if i == j {
-                    continue;
-                }
-                num = mul(t, num, xj);
-                den = mul(t, den, xi ^ xj);
-            }
-            let li0 = mul(t, num, inv(t, den)?);
-            sum ^= mul(t, yi, li0);
-        }
-        Ok(sum)
-    }
-
-    /// R4-5: Lagrange interpolation at arbitrary x over the legacy field.
-    /// Used by the over-determined cross-check at the resplit callsite.
-    ///
-    /// R9-H2 + R9-v2 M-5: same iterator-closure shape as
-    /// `interp_at_zero`, but the Item is `(u8, &[u8])` so the caller can
-    /// borrow each share's payload slice directly (avoiding any per-byte
-    /// (u8, u8) materialisation). `byte_idx` and `x` remain as separate
-    /// usize/u8 args — they are public inputs to the over-determined
-    /// cross-check, not secret-bearing.
-    ///
-    /// The polynomial is uniquely defined by the points produced by
-    /// `points()`; caller MUST ensure that the number of points equals
-    /// `t` (the threshold) and that `x` is NOT one of those indices for
-    /// genuine over-determined verification (otherwise the result would
-    /// trivially equal the existing y at that point — Phase 2 covers
-    /// that case as a correctness-preserving early-return).
-    ///
-    /// SAFETY (in the documentation sense, not unsafe): caller validates
-    /// equal payload_len across all shares before reaching this site (see
-    /// payload-length consistency check at the parse-loop in main()), so
-    /// `byte_idx < payload.len()` for every share. xs holds Shamir
-    /// x-coordinates (public per design); stack residue on panic-unwind is
-    /// information-theoretically irrelevant and accepted.
-    ///
-    /// Phase 1: full xi==0 + duplicate-x scan (transcribed from
-    ///          `interp_at_zero` — must run BEFORE the early-return below
-    ///          so duplicate-x is detected even if x collides with one of
-    ///          the duplicates).
-    /// Phase 2: if x collides with a point's xi, return that point's y_byte
-    ///          directly. (This early-return is correctness-preserving
-    ///          for both x==0 and x==xi-for-some-i; it must NOT precede
-    ///          phase 1 or duplicate-x is masked.)
-    /// Phase 3: Lagrange evaluation: L(x) = Σ y_i · Π_{j≠i} (x ⊕ x_j) / (x_i ⊕ x_j)
-    ///          (in characteristic 2: subtraction = XOR).
-    pub fn interp_at<'a, F, I>(t: &Tables, points: F, byte_idx: usize, x: u8) -> Result<u8, String>
-    where
-        F: Fn() -> I,
-        I: Iterator<Item = (u8, &'a [u8])>,
-    {
-        // Phase 1: xi == 0 + duplicate-x rejection (identical to
-        // interp_at_zero). Re-create the iterator; collect ONLY the
-        // x-coordinates into a stack-resident u8 array.
-        let mut xs = [0u8; 32];
-        let mut n = 0usize;
-        for (xi, _payload) in points() {
-            if xi == 0 {
-                return Err("share index 0 is invalid in legacy field".into());
-            }
-            if n >= xs.len() {
-                return Err(format!("interpolation set exceeds {}-share cap", xs.len()));
-            }
-            if xs[..n].contains(&xi) {
-                return Err(format!("duplicate x={xi} in interpolation set"));
-            }
-            xs[n] = xi;
-            n += 1;
-        }
-        // Phase 2: collision-with-x early-return (correctness-preserving
-        // for x == xi; only legal AFTER phase 1).
-        for (xi, payload) in points() {
-            if xi == x {
-                return Ok(payload[byte_idx]);
-            }
-        }
-        // Phase 3: Lagrange evaluation at arbitrary x.
-        let mut sum: u8 = 0;
-        for (i, (xi, payload)) in points().enumerate() {
-            let mut num: u8 = 1;
-            let mut den: u8 = 1;
-            for (j, &xj) in xs[..n].iter().enumerate() {
-                if i == j {
-                    continue;
-                }
-                num = mul(t, num, x ^ xj);
-                den = mul(t, den, xi ^ xj);
-            }
-            let li_x = mul(t, num, inv(t, den)?);
-            sum ^= mul(t, payload[byte_idx], li_x);
-        }
-        Ok(sum)
-    }
-}
-
 // ───────────────────────────── share parsing ────────────────────────────
-
-struct LegacyShare {
-    threshold: u8,
-    index: u8,        // 1-based, also the X coordinate in the legacy field
-    payload: Vec<u8>, // raw Y-bytes, one per byte of the secret
-}
-
-// R4-4: hand-rolled Debug to keep secret payload bytes out of any
-// future eprintln!("{:?}", share) / dbg!(share) / panic backtrace.
-// The non-secret threshold + index are printed; payload is reduced
-// to its byte length.
-impl std::fmt::Debug for LegacyShare {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LegacyShare")
-            .field("threshold", &self.threshold)
-            .field("index", &self.index)
-            .field(
-                "payload",
-                &format_args!("<redacted; {} bytes>", self.payload.len()),
-            )
-            .finish()
-    }
-}
-
-// H5: zero the share payload on drop. We don't `#[derive(ZeroizeOnDrop)]`
-// here because `u8` does not impl `Zeroize` directly in a derive context
-// for non-Zeroize fields (`threshold`/`index` are non-secret integers we
-// deliberately don't want to scrub). Hand-rolled Drop only touches the
-// secret-bearing `payload`.
-impl Drop for LegacyShare {
-    fn drop(&mut self) {
-        self.payload.zeroize();
-    }
-}
-
-fn parse_legacy_share(s: &str) -> Result<LegacyShare, String> {
-    use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
-
-    let parts: Vec<&str> = s.trim().splitn(3, '-').collect();
-    if parts.len() != 3 {
-        return Err(format!(
-            "expected `T-N-base64`; got line of length {} (content redacted)",
-            s.len()
-        ));
-    }
-    let threshold: u8 = parts[0].parse().map_err(|e| {
-        format!(
-            "bad threshold field (length {}, content redacted): {e}",
-            parts[0].len()
-        )
-    })?;
-    let index: u8 = parts[1].parse().map_err(|e| {
-        format!(
-            "bad index field (length {}, content redacted): {e}",
-            parts[1].len()
-        )
-    })?;
-    if !(2..=31).contains(&threshold) {
-        return Err(format!("threshold {threshold} out of range (2..=31)"));
-    }
-    if !(1..=255).contains(&index) {
-        return Err(format!("index {index} must be 1..=255"));
-    }
-    // R4-4 audit pass: the base64 crate's `DecodeError::Display` reports
-    // the offending byte's value (e.g. "Invalid byte 33, offset 0."),
-    // which on a malformed share line CAN be a payload byte. We classify
-    // the error into a non-content category and report only the encoded
-    // length plus the kind — never the byte value or its offset.
-    let payload = STANDARD_NO_PAD.decode(parts[2].as_bytes()).map_err(|e| {
-        let kind = match e {
-            base64::DecodeError::InvalidByte(_, _) => "invalid base64 byte",
-            base64::DecodeError::InvalidLength(_) => "invalid base64 length",
-            base64::DecodeError::InvalidLastSymbol(_, _) => "invalid base64 last symbol",
-            base64::DecodeError::InvalidPadding => "invalid base64 padding",
-        };
-        format!(
-            "bad base64 payload (length {}, content redacted): {kind}",
-            parts[2].len()
-        )
-    })?;
-    Ok(LegacyShare {
-        threshold,
-        index,
-        payload,
-    })
-}
+//
+// R12-Phase-D / item #6: `parse_legacy_share` + `LegacyShare` moved to
+// `src/parse.rs` so the `fuzz/` crate can import them via the lib. The
+// `use yubihsm_share_converter::parse::{parse_legacy_share, LegacyShare};`
+// import at the top of this file re-binds the names locally so the rest
+// of `main.rs` continues to use the short forms.
 
 // ───────────────────────────── wrap-blob layout ─────────────────────────
 //
@@ -790,11 +375,10 @@ fn validate_payload_len(payload_len: usize) -> Result<(), String> {
 // Lagrange-recover each byte position in the legacy field from `used`.
 // Pulled out of `main()` so the disjoint-subset cross-check can call it
 // twice over different subsets of `shares`.
-fn recover(
-    tabs: &legacy::Tables,
-    used: &[LegacyShare],
-    payload_len: usize,
-) -> Result<Vec<u8>, String> {
+// R12-C-04: signature drops the `tabs: &legacy::Tables` arg — the
+// `Tables` struct was deleted from production code. `mul`/`inv`/
+// `interp_at[_zero]` no longer take it.
+fn recover(used: &[LegacyShare], payload_len: usize) -> Result<Vec<u8>, String> {
     let mut blob = Vec::with_capacity(payload_len);
     for byte_idx in 0..payload_len {
         // R9-H2: closure-producing-iterator pattern. `used` is captured by
@@ -805,7 +389,7 @@ fn recover(
         // raw share Y-bytes and was dropped without scrubbing every loop
         // iteration — the H2 happy-path leak this refactor closes.
         let make_pts = || used.iter().map(|s| (s.index, s.payload[byte_idx]));
-        blob.push(legacy::interp_at_zero(tabs, make_pts)?);
+        blob.push(legacy::interp_at_zero(make_pts)?);
     }
     Ok(blob)
 }
@@ -933,7 +517,13 @@ fn main() -> ExitCode {
     // this file for the threat model. The history-safety gate above at
     // `:488-506` is INTENTIONALLY single-knob (`allow_disk` only); coupling
     // the history gate to the CLI flag would create a regression.
-    let allow_disk = env_flag_truthy("YHSC_ALLOW_DISK_STDOUT");
+    //
+    // R11-C3 R10-M1: `allow_disk` is already bound above and there is no
+    // intervening mutation, so reuse it directly here rather than reading
+    // the env-var a second time. The two reads couldn't diverge today
+    // (same env, no setter between them) but the duplication was a smell
+    // — and a single read makes the dual-knob threat-model boundary
+    // textually obvious.
     let dual_override = allow_disk && opts.i_accept_disk_output;
     let stdout_is_tty = io::stdout().is_terminal();
     let stderr_is_tty = io::stderr().is_terminal();
@@ -1067,7 +657,11 @@ fn main() -> ExitCode {
     // and compared byte-by-byte (R4-5 over-determined Lagrange). When
     // n == t there is no redundancy and --resplit is refused outright
     // BEFORE recover() runs.
-    let tabs = legacy::build_tables();
+    //
+    // R12-C-04: `legacy::build_tables()` was deleted. The legacy module
+    // is now table-free; `mul`/`inv`/`interp_at[_zero]` take plain
+    // (u8, u8)/(u8) args with no precomputed-table sidecar. The
+    // recover() and over-determined paths below pass no `&Tables`.
     let t = threshold as usize;
     let n = shares.len();
 
@@ -1090,26 +684,37 @@ fn main() -> ExitCode {
     // allocation in microseconds; we then zeroize and drop the Vec.
     // (Now safe to recover; the n==t refusal above already exited if
     // --resplit was set with no redundancy.)
-    let mut blob_vec = match recover(&tabs, &shares[..t], payload_len) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(3);
-        }
-    };
+    //
+    // R11-C3 D1: wrap the outer Vec in `Zeroizing` so the destructor
+    // scrubs the (initialized + spare-capacity) backing bytes even on
+    // a panic-window between `recover()` and the explicit `.zeroize()`
+    // + `drop()` below. `Zeroizing<Vec<u8>>` derefs transparently so
+    // call sites are unchanged; the explicit zeroize+drop remains so
+    // the scrub happens AS EARLY AS POSSIBLE on the success path.
+    let mut blob_vec: Zeroizing<Vec<u8>> =
+        Zeroizing::new(match recover(&shares[..t], payload_len) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("error: {e}");
+                return ExitCode::from(3);
+            }
+        });
     let mut blob = Secret::with_capacity(blob_vec.len());
     blob.extend_from_slice(&blob_vec);
     blob_vec.zeroize();
     drop(blob_vec);
 
     if n >= 2 * t {
-        let mut blob2_vec = match recover(&tabs, &shares[t..2 * t], payload_len) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::from(3);
-            }
-        };
+        // R11-C3 D1: same Zeroizing wrap for the disjoint-subset cross-
+        // check site. See the primary recovery site above for rationale.
+        let mut blob2_vec: Zeroizing<Vec<u8>> =
+            Zeroizing::new(match recover(&shares[t..2 * t], payload_len) {
+                Ok(b) => b,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::from(3);
+                }
+            });
         let mut blob2 = Secret::with_capacity(blob2_vec.len());
         blob2.extend_from_slice(&blob2_vec);
         blob2_vec.zeroize();
@@ -1123,40 +728,95 @@ fn main() -> ExitCode {
     } else if n > t {
         // R4-5: over-determined Lagrange cross-check. The polynomial is
         // uniquely defined by shares[..t]; predict each EXTRA share's
-        // Y-byte at its index and compare byte-by-byte.
+        // full Y-payload from the canonical polynomial and constant-time
+        // compare against the supplied Y-payload.
         //
-        // R9-H2 + R9-v2 M-5: interp_at now takes a closure-producing-
-        // iterator. The existing slice borrow is replaced with an inline
-        // closure that streams (index, &payload) pairs. No per-byte
-        // materialisation; the `shares` Vec stays in scope across both
-        // Phase-1 and Phase-3 passes.
+        // R12-C-05: full-blob constant-time verification.
+        //
+        // Pre-R12 the loop was a byte-wise compare that early-returned
+        // on the first mismatch — the early-return leaked the FIRST
+        // differing byte index via the timing of the failure (under
+        // repeated queries an adversary could build a partial-
+        // corruption oracle). The new shape:
+        //
+        //   1. Allocate ALL predicted Y-payloads first (one Zeroizing
+        //      Vec<u8> per extra share). Wrapping in `Zeroizing` so
+        //      the predicted bytes — which are functionally a recovered
+        //      polynomial value, i.e. share material — are scrubbed
+        //      from heap on drop.
+        //   2. Constant-time compare each predicted blob against the
+        //      supplied payload via `constant_time_eq::constant_time_eq`.
+        //   3. Fold the per-share match flag into `all_ok` via a
+        //      NON-short-circuit bitwise-AND on `bool` (`&=` on bool).
+        //      Crucially, `&=` does NOT short-circuit — every iteration
+        //      runs to completion, so the comparison count is constant
+        //      WRT input contents.
+        //   4. After the loop, branch on `all_ok` once. The error
+        //      message is intentionally GENERIC ("shares mismatch —
+        //      one or more extra shares not consistent") with no byte
+        //      index AND no share index leak. The pre-R12 message
+        //      named `s_extra.index` (the FIRST failing share), which
+        //      under repeated probing leaks which share is corrupt.
+        //
+        // R9-H2 + R9-v2 M-5: interp_at takes a closure-producing-
+        // iterator; the closure captures `shares[..t]` and streams
+        // (index, &payload) pairs. No per-byte (u8, u8) materialisation.
+        let mut all_ok = true;
         for s_extra in &shares[t..] {
+            let make_pts = || shares[..t].iter().map(|s| (s.index, s.payload.as_slice()));
+            // Build the predicted Y-payload for this extra share by
+            // evaluating the canonical polynomial at s_extra.index for
+            // every byte position. The interp_at error path is
+            // unreachable in practice (the polynomial is uniquely
+            // defined by shares[..t], and Phase-1 duplicate-x + xi=0
+            // rejection already ran during the primary recover()
+            // call), but we keep the Result handling for the
+            // single-failure mode that interp_at can still produce
+            // (e.g. a maliciously crafted share with index 0 reaching
+            // this site through some bypass — currently impossible per
+            // the M1 parse gate, but defence-in-depth).
+            let mut predicted: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::with_capacity(payload_len));
             for byte_idx in 0..payload_len {
-                let make_pts = || shares[..t].iter().map(|s| (s.index, s.payload.as_slice()));
-                let predicted = match legacy::interp_at(&tabs, make_pts, byte_idx, s_extra.index) {
-                    Ok(b) => b,
+                match legacy::interp_at(make_pts, byte_idx, s_extra.index) {
+                    Ok(b) => predicted.push(b),
                     Err(e) => {
                         eprintln!("error: {e}");
                         return ExitCode::from(3);
                     }
-                };
-                if predicted != s_extra.payload[byte_idx] {
-                    // R4-5 Low-residue redaction: do NOT name byte_idx in
-                    // the user-facing error message. The byte position
-                    // would, on repeated queries, give a partial-corruption
-                    // oracle. The share index is non-secret (it appears
-                    // verbatim in the T-N-base64 share-line format).
-                    eprintln!(
-                        "error: cross-check failed — share index {} payload differs from polynomial fit; refusing.",
-                        s_extra.index
-                    );
-                    eprintln!(
-                        "       At least one of the supplied shares is corrupt. \
-                         Refusing to print a key."
-                    );
-                    return ExitCode::from(4);
                 }
             }
+            // Constant-time full-blob compare. `constant_time_eq` runs
+            // for `min(len_a, len_b)` iterations and folds with bitwise
+            // OR — its return value depends on the full slice contents,
+            // not just a prefix. Both slices are of length `payload_len`
+            // by construction (predicted is built to exactly that
+            // size; s_extra.payload was length-validated by the
+            // parse-loop's payload_len consistency check).
+            let matches = constant_time_eq::constant_time_eq(&predicted, &s_extra.payload);
+            // NON-short-circuit AND. `bool: BitAndAssign<bool>` evaluates
+            // the RHS even when self is already false — exactly the
+            // behaviour required to keep the comparison count constant
+            // WRT input contents. Do NOT replace with `&&` (short-circuit)
+            // — see the over_determined_no_short_circuit_grep test.
+            all_ok &= matches;
+            // predicted goes out of scope here; Zeroizing scrubs.
+        }
+        if !all_ok {
+            // R12-C-05: locator-drop. Message names "one or more" and
+            // contains NEITHER the failing share's index NOR any byte
+            // offset. An attacker who replays a corrupt share-set
+            // under repeated invocations learns ONLY that at least one
+            // share is bad — not which one, and not where the corruption
+            // is. This closes the partial-corruption oracle that the
+            // pre-R12 byte-and-share-index locator opened.
+            eprintln!(
+                "error: over-determined cross-check FAILED (shares mismatch — one or more extra shares are not consistent with the canonical polynomial)"
+            );
+            eprintln!(
+                "       At least one of the supplied shares is corrupt. \
+                 Refusing to print a key."
+            );
+            return ExitCode::from(4);
         }
         eprintln!(
             "[ok] over-determined cross-check passed (n={n}, t={t}, {} extra share(s))",
@@ -1311,7 +971,8 @@ mod tests {
         coeffs_per_byte: &[Vec<u8>],
     ) -> Vec<(u8, Vec<u8>)> {
         assert_eq!(coeffs_per_byte.len(), secret.len());
-        let tabs = legacy::build_tables();
+        // R12-C-04: legacy::build_tables / &Tables arg dropped from the
+        // production legacy module. mul takes (a, b) → u8 directly.
         let mut shares: Vec<(u8, Vec<u8>)> =
             (1..=n).map(|x| (x, vec![0u8; secret.len()])).collect();
 
@@ -1328,8 +989,8 @@ mod tests {
                 let mut acc: u8 = 0;
                 let mut fac: u8 = 1;
                 for &coeff in &poly {
-                    acc ^= legacy::mul(&tabs, fac, coeff);
-                    fac = legacy::mul(&tabs, fac, *x);
+                    acc ^= legacy::mul(fac, coeff);
+                    fac = legacy::mul(fac, *x);
                 }
                 share[byte_idx] = acc;
             }
@@ -1339,24 +1000,25 @@ mod tests {
 
     #[test]
     fn inv_zero_errors() {
-        let t = legacy::build_tables();
-        assert!(legacy::inv(&t, 0).is_err());
+        // R12-C-04: legacy::inv signature drops the &Tables arg.
+        assert!(legacy::inv(0).is_err());
     }
 
     #[test]
     fn interp_rejects_dup_x() {
-        let t = legacy::build_tables();
         // R9-H2: interp_at_zero now accepts a closure producing an iterator.
         // The `u8` type suffix on each literal is REQUIRED: without it the
         // array-literal's inferred integer type defaults to `i32`, which
         // fails to unify with `Iterator::Item = (u8, u8)`.
-        assert!(legacy::interp_at_zero(&t, || [(2u8, 9u8), (2u8, 9u8)].iter().copied()).is_err());
+        //
+        // R12-C-04: interp_at_zero signature drops the &Tables arg.
+        assert!(legacy::interp_at_zero(|| [(2u8, 9u8), (2u8, 9u8)].iter().copied()).is_err());
     }
 
     #[test]
     fn interp_rejects_zero_x() {
-        let t = legacy::build_tables();
-        assert!(legacy::interp_at_zero(&t, || [(0u8, 5u8), (1u8, 7u8)].iter().copied()).is_err());
+        // R12-C-04: signature drop.
+        assert!(legacy::interp_at_zero(|| [(0u8, 5u8), (1u8, 7u8)].iter().copied()).is_err());
     }
 
     #[test]
@@ -1365,28 +1027,26 @@ mod tests {
         // interp_at_zero back to `&[(u8, u8)]` would fail to compile this
         // test. The closure shape pinned here matches the production call
         // in fn recover(): `|| used.iter().map(|s| (s.index, s.payload[i]))`.
-        let t = legacy::build_tables();
+        //
+        // R12-C-04: signature drop.
         let pts = [(1u8, 0u8), (2u8, 0u8)];
         let make = || pts.iter().copied();
-        let _: Result<u8, _> = legacy::interp_at_zero(&t, make);
+        let _: Result<u8, _> = legacy::interp_at_zero(make);
     }
 
     #[test]
     fn legacy_field_basics() {
-        let t = legacy::build_tables();
+        // R12-C-04: signature drops the &Tables arg. mul/inv take their
+        // operands directly.
         // 2 * 2 in GF(2^8) under poly 0x11D is 4 (no reduction needed yet).
-        assert_eq!(legacy::mul(&t, 2, 2), 4);
+        assert_eq!(legacy::mul(2, 2), 4);
         // A few entries from rusty-secrets v0.0.2 by manual check:
         // 2^8 reduced by 0x11D = 0x1D.
         // The generator is 2; exp[8] should be 0x1D.
-        assert_eq!(legacy::mul(&t, 0x80, 2), 0x1D);
+        assert_eq!(legacy::mul(0x80, 2), 0x1D);
         // a * a^-1 = 1 for every nonzero a.
         for a in 1u8..=255 {
-            assert_eq!(
-                legacy::mul(&t, a, legacy::inv(&t, a).unwrap()),
-                1,
-                "fail at a={a}"
-            );
+            assert_eq!(legacy::mul(a, legacy::inv(a).unwrap()), 1, "fail at a={a}");
         }
     }
 
@@ -1405,7 +1065,7 @@ mod tests {
         assert_eq!(shares.len(), 3);
 
         // Now recover via the production interp_at_zero from any 2 shares.
-        let tabs = legacy::build_tables();
+        // R12-C-04: interp_at_zero drops the &Tables arg.
         for combo in &[(0usize, 1usize), (0, 2), (1, 2)] {
             let (a, b) = *combo;
             let mut recovered = Vec::with_capacity(secret.len());
@@ -1415,7 +1075,7 @@ mod tests {
                     (shares[b].0, shares[b].1[byte_idx]),
                 ];
                 let make = || pts.iter().copied();
-                recovered.push(legacy::interp_at_zero(&tabs, make).unwrap());
+                recovered.push(legacy::interp_at_zero(make).unwrap());
             }
             assert_eq!(recovered, secret, "combo {combo:?} did not round-trip");
         }
@@ -1444,7 +1104,7 @@ mod tests {
         let shares = legacy_split(&secret, 2, 3, &coeffs);
         assert_eq!(shares.len(), 3);
 
-        let tabs = legacy::build_tables();
+        // R12-C-04: interp_at_zero drops &Tables.
         for combo in &[(0usize, 1usize), (0, 2), (1, 2)] {
             let (a, b) = *combo;
             let mut recovered = Vec::with_capacity(secret.len());
@@ -1454,7 +1114,7 @@ mod tests {
                     (shares[b].0, shares[b].1[byte_idx]),
                 ];
                 let make = || pts.iter().copied();
-                recovered.push(legacy::interp_at_zero(&tabs, make).unwrap());
+                recovered.push(legacy::interp_at_zero(make).unwrap());
             }
             assert_eq!(
                 recovered, secret,
@@ -1474,10 +1134,10 @@ mod tests {
         let shares = legacy_split(&secret, 2, 3, &coeffs);
         assert_eq!(shares.len(), 3);
 
-        let tabs = legacy::build_tables();
         // The spec requires "at least one combination" round-trips for
         // AES-192. We assert all three for symmetry with AES-128 — this
         // is strictly stronger and equally cheap.
+        // R12-C-04: interp_at_zero drops &Tables.
         for combo in &[(0usize, 1usize), (0, 2), (1, 2)] {
             let (a, b) = *combo;
             let mut recovered = Vec::with_capacity(secret.len());
@@ -1487,7 +1147,7 @@ mod tests {
                     (shares[b].0, shares[b].1[byte_idx]),
                 ];
                 let make = || pts.iter().copied();
-                recovered.push(legacy::interp_at_zero(&tabs, make).unwrap());
+                recovered.push(legacy::interp_at_zero(make).unwrap());
             }
             assert_eq!(
                 recovered, secret,
@@ -1506,14 +1166,14 @@ mod tests {
             .collect();
 
         let shares = legacy_split(&secret, 3, 5, &coeffs);
-        let tabs = legacy::build_tables();
 
         // Take shares #2, #4, #5 (i.e. x=2,4,5) and recover.
+        // R12-C-04: interp_at_zero drops &Tables.
         let chosen = [1usize, 3, 4];
         let mut recovered = Vec::with_capacity(secret.len());
         for byte_idx in 0..secret.len() {
             let make = || chosen.iter().map(|&i| (shares[i].0, shares[i].1[byte_idx]));
-            recovered.push(legacy::interp_at_zero(&tabs, make).unwrap());
+            recovered.push(legacy::interp_at_zero(make).unwrap());
         }
         assert_eq!(recovered, secret);
     }
@@ -1703,112 +1363,11 @@ mod tests {
         validate_payload_len(MIN_PAYLOAD_LEN).expect("MIN_PAYLOAD_LEN must be accepted");
     }
 
-    #[test]
-    fn parse_share_format() {
-        // 70 base64 chars → 52 raw bytes (matches yubihsm-setup regex).
-        let payload = vec![0x42u8; 52];
-        let b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, &payload);
-        assert_eq!(b64.len(), 70);
-        let s = format!("2-1-{b64}");
-        let parsed = parse_legacy_share(&s).unwrap();
-        assert_eq!(parsed.threshold, 2);
-        assert_eq!(parsed.index, 1);
-        assert_eq!(parsed.payload, payload);
-    }
-
-    // M1: post-widening, threshold 10 (and up to 31) must parse cleanly.
-    #[test]
-    fn parse_threshold_10_accepted() {
-        let payload = vec![0x42u8; 52];
-        let b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, &payload);
-        assert_eq!(b64.len(), 70);
-        let s = format!("10-1-{b64}");
-        let parsed = parse_legacy_share(&s).expect("threshold=10 must parse after M1");
-        assert_eq!(parsed.threshold, 10);
-        assert_eq!(parsed.index, 1);
-    }
-
-    // M1: thresholds above the 2..=31 window must still be rejected.
-    #[test]
-    fn parse_threshold_32_rejected() {
-        let payload = vec![0x42u8; 52];
-        let b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, &payload);
-        let s = format!("32-1-{b64}");
-        let err = parse_legacy_share(&s).expect_err("threshold=32 must be rejected");
-        assert!(err.contains("32"), "unexpected error: {err}");
-        assert!(err.contains("out of range"), "unexpected error: {err}");
-    }
-
-    // M1: post-widening, share-index 10 (and up to 255) must parse cleanly.
-    #[test]
-    fn parse_index_10_accepted() {
-        let payload = vec![0x42u8; 52];
-        let b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, &payload);
-        assert_eq!(b64.len(), 70);
-        let s = format!("3-10-{b64}");
-        let parsed = parse_legacy_share(&s).expect("index=10 must parse after M1");
-        assert_eq!(parsed.threshold, 3);
-        assert_eq!(parsed.index, 10);
-    }
-
-    // M1: index = 0 is still rejected (1..=255 is the new range).
-    #[test]
-    fn parse_index_0_rejected() {
-        let payload = vec![0x42u8; 52];
-        let b64 =
-            base64::Engine::encode(&base64::engine::general_purpose::STANDARD_NO_PAD, &payload);
-        let s = format!("3-0-{b64}");
-        let err = parse_legacy_share(&s).expect_err("index=0 must be rejected");
-        assert!(err.contains("index 0"), "unexpected error: {err}");
-        assert!(err.contains("1..=255"), "unexpected error: {err}");
-    }
-
-    // R4-4: the hand-rolled `Debug` impl on `LegacyShare` must redact the
-    // payload bytes. We construct a recognisable canary payload (ASCII
-    // "ABCD" = 0x41 0x42 0x43 0x44) and assert the formatted string
-    // reports only the byte length, NOT any of the byte values in any
-    // common debug encoding (decimal, hex, ASCII).
-    #[test]
-    fn legacy_share_debug_redacts_payload() {
-        let share = LegacyShare {
-            threshold: 2,
-            index: 1,
-            payload: vec![0x41, 0x42, 0x43, 0x44],
-        };
-        let dbg = format!("{share:?}");
-        assert!(
-            dbg.contains("<redacted; 4 bytes>"),
-            "Debug must contain the redaction marker; got: {dbg}"
-        );
-        // Non-secret metadata is allowed and useful for diagnosis.
-        assert!(
-            dbg.contains("threshold: 2"),
-            "Debug should still print threshold; got: {dbg}"
-        );
-        assert!(
-            dbg.contains("index: 1"),
-            "Debug should still print index; got: {dbg}"
-        );
-        // Forbidden: the ASCII rendering of the canary payload.
-        assert!(!dbg.contains("ABCD"), "Debug leaked ASCII payload: {dbg}");
-        // Forbidden: hex byte renderings (lowercase + uppercase).
-        for h in ["41", "42", "43", "44"] {
-            assert!(!dbg.contains(h), "Debug leaked hex byte {h}: {dbg}");
-        }
-        // Forbidden: the decimal `[u8]`-debug rendering.
-        for d in ["65", "66", "67", "68"] {
-            assert!(!dbg.contains(d), "Debug leaked decimal byte {d}: {dbg}");
-        }
-        // Forbidden: the literal `Vec<u8>` debug bracket form.
-        assert!(
-            !dbg.contains("[65, 66, 67, 68]"),
-            "Debug leaked Vec<u8> array form: {dbg}"
-        );
-    }
+    // R12-Phase-D / item #6: parse-specific tests (`parse_share_format`,
+    // `parse_threshold_10_accepted`, `parse_threshold_32_rejected`,
+    // `parse_index_10_accepted`, `parse_index_0_rejected`,
+    // `legacy_share_debug_redacts_payload`) moved to
+    // `src/parse.rs::tests` alongside the production code they exercise.
 
     // ───────────────────────── H1 cross-check tests ─────────────────────
     //
@@ -1838,17 +1397,17 @@ mod tests {
 
     #[test]
     fn cross_check_detects_disjoint_corruption() {
+        // R12-C-04: recover() drops the &Tables arg.
         let (secret, mut shares) = make_2of5_shares();
         // Sanity: both disjoint subsets recover the original secret.
-        let tabs = legacy::build_tables();
-        let blob_a = recover(&tabs, &shares[..2], secret.len()).unwrap();
-        let blob_b = recover(&tabs, &shares[2..4], secret.len()).unwrap();
+        let blob_a = recover(&shares[..2], secret.len()).unwrap();
+        let blob_b = recover(&shares[2..4], secret.len()).unwrap();
         assert_eq!(blob_a, secret);
         assert_eq!(blob_b, secret);
         // Corrupt shares[0] — that share is only in the first subset.
         shares[0].payload[5] ^= 0x01;
-        let blob_a = recover(&tabs, &shares[..2], secret.len()).unwrap();
-        let blob_b = recover(&tabs, &shares[2..4], secret.len()).unwrap();
+        let blob_a = recover(&shares[..2], secret.len()).unwrap();
+        let blob_b = recover(&shares[2..4], secret.len()).unwrap();
         // The first subset must now disagree with the second; this is
         // the path that triggers exit 4 in main().
         assert_ne!(
@@ -1862,11 +1421,11 @@ mod tests {
     fn cross_check_detects_disjoint_corruption_in_second_subset() {
         // Symmetric regression guard: corrupting a share that only the
         // second subset uses must also be detected.
+        // R12-C-04: recover() drops the &Tables arg.
         let (secret, mut shares) = make_2of5_shares();
         shares[3].payload[17] ^= 0x80;
-        let tabs = legacy::build_tables();
-        let blob_a = recover(&tabs, &shares[..2], secret.len()).unwrap();
-        let blob_b = recover(&tabs, &shares[2..4], secret.len()).unwrap();
+        let blob_a = recover(&shares[..2], secret.len()).unwrap();
+        let blob_b = recover(&shares[2..4], secret.len()).unwrap();
         assert_eq!(blob_a, secret, "first subset is untouched");
         assert_ne!(blob_b, secret, "second subset must reflect the corruption");
         assert_ne!(blob_a, blob_b);
@@ -1875,10 +1434,10 @@ mod tests {
 
     #[test]
     fn cross_check_passes_clean() {
+        // R12-C-04: recover() drops the &Tables arg.
         let (secret, shares) = make_2of5_shares();
-        let tabs = legacy::build_tables();
-        let blob_a = recover(&tabs, &shares[..2], secret.len()).unwrap();
-        let blob_b = recover(&tabs, &shares[2..4], secret.len()).unwrap();
+        let blob_a = recover(&shares[..2], secret.len()).unwrap();
+        let blob_b = recover(&shares[2..4], secret.len()).unwrap();
         assert_eq!(blob_a, secret);
         assert_eq!(blob_b, secret);
         assert!(constant_time_eq::constant_time_eq(&blob_a, &blob_b));
@@ -1899,7 +1458,7 @@ mod tests {
         // it indexes share.payload[byte_idx] in place rather than taking
         // a pre-built (xi, yi) slice. A divergence here would mean a
         // typo in the new evaluator (e.g. wrong XOR direction).
-        let tabs = legacy::build_tables();
+        // R12-C-04: interp_at[_zero] drops the &Tables arg.
         // Three indices, each carries a distinct toy y-byte at position 0.
         let shares = [
             LegacyShare {
@@ -1919,9 +1478,9 @@ mod tests {
             },
         ];
         let make_pts_zero = || shares.iter().map(|s| (s.index, s.payload[0]));
-        let lhs = legacy::interp_at_zero(&tabs, make_pts_zero).expect("interp_at_zero ok");
+        let lhs = legacy::interp_at_zero(make_pts_zero).expect("interp_at_zero ok");
         let make_pts = || shares.iter().map(|s| (s.index, s.payload.as_slice()));
-        let rhs = legacy::interp_at(&tabs, make_pts, 0, 0).expect("interp_at ok");
+        let rhs = legacy::interp_at(make_pts, 0, 0).expect("interp_at ok");
         assert_eq!(lhs, rhs, "interp_at(x=0) must agree with interp_at_zero");
     }
 
@@ -1930,7 +1489,7 @@ mod tests {
         // Phase-2 early-return: when `x` collides with one of the
         // (post-phase-1-validated) xi values, return that share's
         // payload[byte_idx] rather than dividing by zero in the basis.
-        let tabs = legacy::build_tables();
+        // R12-C-04: interp_at drops the &Tables arg.
         let shares = [
             LegacyShare {
                 threshold: 2,
@@ -1944,7 +1503,7 @@ mod tests {
             },
         ];
         let make_pts = || shares.iter().map(|s| (s.index, s.payload.as_slice()));
-        let got = legacy::interp_at(&tabs, make_pts, 3, 5).expect("interp_at must early-return");
+        let got = legacy::interp_at(make_pts, 3, 5).expect("interp_at must early-return");
         assert_eq!(
             got, 0x42,
             "early-return must surface payload[3] for index=5"
@@ -1956,7 +1515,7 @@ mod tests {
         // Phase-1: xi == 0 is invalid in the legacy field (the polynomial
         // is evaluated as f(x) at the share index, and rusty-secrets v0.0.2
         // by construction starts indices at 1).
-        let tabs = legacy::build_tables();
+        // R12-C-04: interp_at drops the &Tables arg.
         let shares = [
             LegacyShare {
                 threshold: 2,
@@ -1970,7 +1529,7 @@ mod tests {
             },
         ];
         let make_pts = || shares.iter().map(|s| (s.index, s.payload.as_slice()));
-        let err = legacy::interp_at(&tabs, make_pts, 0, 7).expect_err("xi=0 must be rejected");
+        let err = legacy::interp_at(make_pts, 0, 7).expect_err("xi=0 must be rejected");
         assert!(
             err.contains("share index 0 is invalid"),
             "unexpected error: {err}"
@@ -1984,7 +1543,7 @@ mod tests {
         // [(3, A), (3, B)] queried at x=3 would early-return A and never
         // report the duplicate-x corruption — silent acceptance of a
         // malformed point set.
-        let tabs = legacy::build_tables();
+        // R12-C-04: interp_at drops the &Tables arg.
         let shares = [
             LegacyShare {
                 threshold: 2,
@@ -1998,7 +1557,7 @@ mod tests {
             },
         ];
         let make_pts = || shares.iter().map(|s| (s.index, s.payload.as_slice()));
-        let err = legacy::interp_at(&tabs, make_pts, 0, 3)
+        let err = legacy::interp_at(make_pts, 0, 3)
             .expect_err("duplicate x must be detected even when x collides");
         assert!(
             err.contains("duplicate x=3"),
@@ -2028,13 +1587,13 @@ mod tests {
                 payload,
             })
             .collect();
-        let tabs = legacy::build_tables();
+        // R12-C-04: interp_at drops the &Tables arg.
 
         // Sanity: clean shares all agree under interp_at.
         for byte_idx in 0..secret.len() {
             let make_pts = || shares[..2].iter().map(|s| (s.index, s.payload.as_slice()));
-            let predicted = legacy::interp_at(&tabs, make_pts, byte_idx, shares[2].index)
-                .expect("interp_at ok");
+            let predicted =
+                legacy::interp_at(make_pts, byte_idx, shares[2].index).expect("interp_at ok");
             assert_eq!(
                 predicted, shares[2].payload[byte_idx],
                 "clean share[2] must match polynomial fit at byte_idx={byte_idx}"
@@ -2049,8 +1608,8 @@ mod tests {
         let mut mismatch_at: Option<usize> = None;
         for byte_idx in 0..secret.len() {
             let make_pts = || shares[..2].iter().map(|s| (s.index, s.payload.as_slice()));
-            let predicted = legacy::interp_at(&tabs, make_pts, byte_idx, shares[2].index)
-                .expect("interp_at ok");
+            let predicted =
+                legacy::interp_at(make_pts, byte_idx, shares[2].index).expect("interp_at ok");
             if predicted != shares[2].payload[byte_idx] {
                 mismatch_at = Some(byte_idx);
                 break;
@@ -2104,6 +1663,12 @@ mod tests {
         assert_ne!(n_multi, 1, "multi-thread sample must NOT yield n=1");
     }
 
+    // R12-Phase-D / item #8: libc-touching test path. miri does not
+    // model `prctl` / `setrlimit` syscalls; under `cargo miri test`
+    // the libc call would panic with an "unsupported operation"
+    // error. Gate the test out so the miri job stays focused on the
+    // algorithmic kernels that miri CAN model.
+    #[cfg(not(miri))]
     #[test]
     fn lock_down_process_is_idempotent() {
         // Both prctl(PR_SET_DUMPABLE, 0) and setrlimit(RLIMIT_CORE, {0,0})
@@ -2146,8 +1711,8 @@ mod tests {
         let n = 2usize;
         let t = 2usize;
         assert!(n < 2 * t, "warning branch must fire for n=t=2");
-        let tabs = legacy::build_tables();
-        let blob = recover(&tabs, &shares[..t], secret.len()).unwrap();
+        // R12-C-04: recover() drops the &Tables arg.
+        let blob = recover(&shares[..t], secret.len()).unwrap();
         assert_eq!(blob, secret);
     }
 
@@ -2221,6 +1786,271 @@ mod tests {
         assert!(
             !env_flag_truthy(name),
             "unset env-var must read as NOT truthy"
+        );
+    }
+
+    // ───────────────────── R11-V2-residue: dhat heap-residue ────────────
+    //
+    // dhat's `Profiler::new_heap()` panics if called while another
+    // `Profiler` is already running. This is the ONLY test in the suite
+    // that touches dhat's profiler API; the static Mutex below is a
+    // forward-compatibility guard so that adding a second dhat test in a
+    // future commit cannot accidentally trigger the "creating a profiler
+    // while a profiler is already running" panic. The mutex is acquired
+    // BEFORE `Profiler::new_heap()` and released when `_lock` (and
+    // therefore `_profiler`) goes out of scope.
+    //
+    // Caveat: the dhat::Alloc global allocator is active for all `cargo
+    // test` runs (under `#[cfg(test)]` at crate root); other tests still
+    // allocate concurrently, and those allocations can appear in the
+    // before/after snapshot delta. The assertion below is therefore an
+    // upper bound (`delta <= 1`) rather than equality (`delta == 1`) so
+    // it is robust to a small amount of concurrent allocator traffic —
+    // any larger residue (≥ 2 net blocks) is treated as a regression in
+    // recover()'s allocation discipline.
+    use std::sync::Mutex;
+    static DHAT_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Build a deterministic synthetic 2-of-3 share set sized to a 36-byte
+    /// AES-128 wrap blob. Inlined here (rather than reusing
+    /// `make_2of5_shares`) so the dhat test's allocator residue is
+    /// dominated by the `recover()` call itself, not by share-construction
+    /// happening between the two HeapStats snapshots. Shares are built
+    /// BEFORE the profiler is consulted; all setup allocations are
+    /// finalised before `before = HeapStats::get()` runs.
+    fn synthetic_shares_for_dhat_test() -> Vec<LegacyShare> {
+        let secret: Vec<u8> = (0..36).map(|i| (i as u8).wrapping_mul(7) ^ 0xA5).collect();
+        let coeffs: Vec<Vec<u8>> = (0..secret.len())
+            .map(|i| vec![((i as u8).wrapping_add(0x11)) ^ 0x5A])
+            .collect();
+        let raw = legacy_split(&secret, 2, 3, &coeffs);
+        raw.into_iter()
+            .map(|(x, payload)| LegacyShare {
+                threshold: 2,
+                index: x,
+                payload,
+            })
+            .collect()
+    }
+
+    // R12-Phase-D / item #8: dhat installs a global allocator that
+    // miri does not support (miri uses its own allocator/heap model).
+    // The test is irrelevant under miri anyway — miri natively
+    // tracks every allocation and would surface any leak loudly.
+    #[cfg(not(miri))]
+    #[test]
+    fn recover_makes_at_most_one_heap_alloc() {
+        // Serialise against any other (future) dhat-using test so that
+        // `Profiler::new_heap()` cannot race against itself.
+        let _lock = DHAT_LOCK.lock().unwrap();
+
+        // Build the share set BEFORE starting the profiler so the
+        // synthetic-share allocator traffic doesn't fall inside the
+        // measurement window.
+        // R12-C-04: recover() drops the &Tables arg.
+        let shares = synthetic_shares_for_dhat_test();
+
+        // Drop the returned blob immediately on each iteration so the
+        // net delta from a clean iteration is bounded — the legitimate
+        // `Vec::with_capacity(payload_len)` is born and dies INSIDE the
+        // before/after window, so a clean (no-parallel-pollution)
+        // iteration must show delta == 0, NOT 1. We still upper-bound
+        // by 1 to be robust against an iteration in which the Vec is
+        // observed live in the `after` snapshot before Drop runs.
+        let _profiler = dhat::Profiler::new_heap();
+
+        // Take the MINIMUM delta over a handful of iterations. Parallel-
+        // sibling tests can only ADD to the live-block delta between
+        // before/after — they cannot subtract — so the minimum across
+        // iterations is the tightest upper bound on `recover()`'s own
+        // residue. At least one iteration is expected to run without
+        // any parallel allocation traffic in our test mix.
+        const ITERS: u32 = 16;
+        let mut min_delta = usize::MAX;
+        for _ in 0..ITERS {
+            let before = dhat::HeapStats::get();
+            let blob = recover(&shares[..2], 36).expect("recover");
+            let after = dhat::HeapStats::get();
+            // Sanity: the recovered blob must be the expected length on
+            // every iteration.
+            assert_eq!(blob.len(), 36, "recover() must return a 36-byte blob");
+            drop(blob); // explicit Drop so the Vec's heap block is freed
+                        // before the next iteration's `before` snapshot.
+            let delta = after.curr_blocks.saturating_sub(before.curr_blocks);
+            min_delta = min_delta.min(delta);
+            if min_delta == 0 {
+                // Best possible result; further iterations cannot
+                // improve on this.
+                break;
+            }
+        }
+
+        // The legitimate destination `blob: Vec<u8>` allocation is the
+        // only heap block that could appear in the after snapshot. The
+        // R9-H2 closure-iterator path in recover() must NOT introduce
+        // any per-byte heap allocation. Upper-bound `<= 1` to allow for
+        // the iteration in which the blob is still live at the `after`
+        // snapshot (Vec is dropped after the snapshot).
+        assert!(
+            min_delta <= 1,
+            "expected <= 1 net heap alloc in recover() (min across {ITERS} iters), got {min_delta}"
+        );
+    }
+
+    // ───────────────────── R12-C-05: over-determined source-form guards ─
+    //
+    // STRUCTURAL anti-regression tests that scan the main.rs source via
+    // `include_str!` to lock in the load-bearing properties of the
+    // over-determined cross-check:
+    //
+    //   1. `constant_time_eq::` MUST appear in the over-determined branch.
+    //   2. `Zeroizing<Vec<u8>>` (or shorter `Zeroizing::new(Vec`) MUST
+    //      wrap the predicted-blob buffer.
+    //   3. `&=` (non-short-circuit bitwise AND) on bool MUST be the way
+    //      per-extra match flags fold into `all_ok` — and `&&`
+    //      (short-circuit) on `all_ok` is forbidden.
+    //   4. The error message MUST NOT name "byte" + a numeric index.
+    //
+    // These greps complement the end-to-end CLI tests in
+    // tests/cli.rs::over_determined_*. They catch a refactor that
+    // accidentally reverts to byte-wise early-return, drops the
+    // Zeroizing wrap, or short-circuits the per-share check.
+
+    /// Extract the over-determined branch source: from the `else if n > t {`
+    /// guard down to the matching closing brace. Used by the four greps
+    /// below; computed once per test invocation.
+    fn over_determined_branch_source() -> &'static str {
+        let src = include_str!("main.rs");
+        let start = src
+            .find("else if n > t {")
+            .expect("main.rs must contain the `else if n > t {` over-determined guard");
+        // Find the next `} else {` (the n == t else branch) — that
+        // delimits the over-determined branch end.
+        let after = &src[start..];
+        let end_offset = after
+            .find("} else {")
+            .expect("over-determined branch must be followed by an `} else {` for n == t");
+        // Return a 'static slice via Box::leak(String) — but we can do
+        // better: include_str! already returns 'static, so a sub-slice
+        // of it is also 'static. Build it via raw pointer slicing — or,
+        // safer, return a Box::leak'd owned String. Keep this test-only:
+        // Box::leak is fine here.
+        Box::leak(
+            after[..end_offset + "} else {".len()]
+                .to_string()
+                .into_boxed_str(),
+        )
+    }
+
+    #[test]
+    fn over_determined_full_blob_uses_constant_time_eq_grep() {
+        // R12-C-05: the over-determined check MUST call
+        // `constant_time_eq::constant_time_eq` (the full-blob constant-
+        // time compare). Pre-R12 a `if predicted != share.payload[byte_idx]`
+        // byte-wise compare was used; any future refactor that
+        // reintroduces direct `!=` on Vec<u8> bytes would defeat the
+        // constant-time discipline. This grep guards against it.
+        let body = over_determined_branch_source();
+        assert!(
+            body.contains("constant_time_eq::"),
+            "regression: over-determined branch does not call constant_time_eq:: (R12-C-05 forbids)"
+        );
+    }
+
+    #[test]
+    fn over_determined_full_blob_uses_zeroizing_grep() {
+        // R12-C-05: the predicted blob (which holds reconstructed share
+        // bytes — i.e. derived secret material) MUST be wrapped in
+        // Zeroizing so its heap memory is scrubbed on drop. A future
+        // refactor that drops the Zeroizing wrap would leak the
+        // predicted bytes on panic-window between alloc and explicit
+        // drop. Defended by this source-form grep.
+        let body = over_determined_branch_source();
+        assert!(
+            body.contains("Zeroizing<Vec<u8>>") || body.contains("Zeroizing::new(Vec"),
+            "regression: over-determined branch lacks Zeroizing wrap on predicted blob (R12-C-05 requires)"
+        );
+    }
+
+    #[test]
+    fn over_determined_no_short_circuit_grep() {
+        // R12-C-05: the per-extra-share match flag MUST fold into
+        // `all_ok` via NON-short-circuit AND. The Rust idiom is `&=`
+        // on bool (which always evaluates RHS) — NOT `&&` (which
+        // short-circuits and would re-introduce a timing channel on
+        // the first failure). This grep verifies the assignment form.
+        let body = over_determined_branch_source();
+        assert!(
+            body.contains("all_ok &= "),
+            "regression: over-determined branch lacks non-short-circuit `all_ok &= ...` (R12-C-05 requires)"
+        );
+        // Also forbid the short-circuit form on the same variable.
+        // `&&` is a perfectly legal Rust operator and can legitimately
+        // appear ELSEWHERE in the branch (e.g. in a guard); we restrict
+        // the prohibition to the explicit `all_ok && ` and `&& all_ok`
+        // forms.
+        assert!(
+            !body.contains("all_ok && "),
+            "regression: over-determined branch uses short-circuit `all_ok && ...` (R12-C-05 forbids)"
+        );
+        assert!(
+            !body.contains("&& all_ok"),
+            "regression: over-determined branch uses short-circuit `&& all_ok` (R12-C-05 forbids)"
+        );
+    }
+
+    #[test]
+    fn over_determined_error_message_has_no_byte_locator_in_source_grep() {
+        // R12-C-05 LOCATOR-DROP: the user-facing eprintln!() strings in
+        // the over-determined branch MUST NOT name a "byte <N>" locator
+        // (pre-R12 the message was `byte_idx N share-index M differs`).
+        // This grep extracts ONLY the eprintln! calls (not the loop
+        // bookkeeping variable `byte_idx` which legitimately appears as
+        // the for-loop iterator) and scans them for forbidden phrasings.
+        let body = over_determined_branch_source();
+        // Concatenate every eprintln!(...) call body into one buffer so
+        // the assertion targets user-facing message strings only.
+        let mut messages = String::new();
+        for piece in body.split("eprintln!(").skip(1) {
+            // Take up to the closing `);` — fragile but adequate for our
+            // controlled source shape.
+            if let Some(end) = piece.find(");") {
+                messages.push_str(&piece[..end]);
+                messages.push('\n');
+            }
+        }
+        assert!(
+            !messages.is_empty(),
+            "over_determined_branch_source must contain at least one eprintln!"
+        );
+        // Forbidden literal substrings in user-facing error messages.
+        for forbidden in &[
+            "byte_idx",
+            "byte {byte_idx}",
+            "byte {}",
+            "byte position",
+            "at byte",
+        ] {
+            assert!(
+                !messages.contains(forbidden),
+                "regression: over-determined error MESSAGE contains forbidden `{forbidden}`. messages were:\n{messages}"
+            );
+        }
+        // Forbidden: any "share index {variable}" or "share index N"
+        // phrasing in the error messages — the locator-drop discipline
+        // applies to share indices too.
+        for forbidden in &["share index {", "s_extra.index", "share #{"] {
+            assert!(
+                !messages.contains(forbidden),
+                "regression: over-determined error MESSAGE leaks share index via `{forbidden}`; messages were:\n{messages}"
+            );
+        }
+        // Required: the new generic phrasing must appear in the messages.
+        assert!(
+            messages.contains("one or more")
+                || messages.contains("shares mismatch")
+                || messages.contains("over-determined cross-check FAILED"),
+            "over-determined error MESSAGE must contain the R12-C-05 generic phrasing; messages were:\n{messages}"
         );
     }
 }

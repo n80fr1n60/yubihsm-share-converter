@@ -170,6 +170,9 @@ done
 # umask 077 gate. Don't re-mkdir here.
 
 echo "[stage] verifying HSM is at factory state (1 object: default auth-key)"
+# R12-02 parity gate: this grep's format-shape is exercised against
+# tests/fixtures/device-transcripts/yubihsm-shell-list-objects.txt via
+# scripts/tests/test_transcript_parity.sh — see that test's "Parser 1" block.
 n_obj=$(shell -a list-objects 2>/dev/null | grep -c '^id:')
 if [ "$n_obj" != "1" ]; then
     echo "[stage] error: HSM has $n_obj objects; expected 1 (default auth-key)." >&2
@@ -202,11 +205,17 @@ echo "[stage] driving 'yubihsm-setup ksp' to generate legacy shares ($THRESHOLD-
 # Discover and TRACK them BEFORE the share-extraction step, so a parse
 # failure below still hits the cleanup trap with non-empty CREATED_*
 # (otherwise leaked objects survive the abort path — see H8 v3-review N12).
+# R12-02 parity gate: both awk extractors below are exercised against
+# tests/fixtures/device-transcripts/yubihsm-shell-list-objects.txt via
+# scripts/tests/test_transcript_parity.sh ("Parser 2" / "Parser 3" blocks).
+# The post-R10-L2-hotfix column-anchored `$4 == "wrap-key"` predicate is
+# load-bearing — the pre-hotfix `/^wrap-key,/` regex modelled a fabricated
+# test-stub format and missed the real `id: 0xXXXX, type: T, …` shape.
 NEW_WRAP_ID=$(shell -a list-objects 2>/dev/null \
-    | awk -F'[, ]+' '/^wrap-key,/ {print $2; exit}')
+    | awk -F'[, ]+' '$4 == "wrap-key" {print $2; exit}')
 CREATED_WRAP_ID="$NEW_WRAP_ID"
 APP_AUTH_ID=$(shell -a list-objects 2>/dev/null \
-    | awk -F'[, ]+' '/^authentication-key,/ && $2 != "0x0001" {print $2; exit}')
+    | awk -F'[, ]+' '$4 == "authentication-key" && $2 != "0x0001" {print $2; exit}')
 CREATED_APP_AUTH_ID="$APP_AUTH_ID"
 echo "[stage] HSM now holds wrap-key $NEW_WRAP_ID and app auth-key $APP_AUTH_ID"
 

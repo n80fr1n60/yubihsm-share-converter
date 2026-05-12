@@ -1,5 +1,9 @@
 # Rust build output
 /target/
+/fuzz/target/
+/fuzz/artifacts/
+/fuzz/coverage/
+/fuzz/corpus/
 
 # Python bytecode and test caches
 __pycache__/
@@ -41,3 +45,22 @@ htmlcov/
 *.profraw
 *.profdata
 /coverage/
+
+# R11-V2-residue / SD-7: dhat heap-profile output. The
+# `recover_makes_at_most_one_heap_alloc` test writes this in testing
+# mode and on assert-failure; it must not be committed.
+dhat-heap.json
+
+# R11-C3 D4: editor / IDE / agent scratch & backup detritus.
+# These directories and patterns are common across IDEs, OSes, and
+# Claude-style agents; committing any of them by accident would leak
+# local config or in-flight scratch into the repo.
+.vscode/
+.idea/
+*.bak
+*.orig
+.claude/
+.codex/
+.agents/
+ceremony/
+scratch/

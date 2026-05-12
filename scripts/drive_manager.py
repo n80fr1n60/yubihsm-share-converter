@@ -358,6 +358,11 @@ def main():
         # regex avoids the bare-substring "List" race (v2 review N#11) AND
         # the ANSI-interleave problem we hit when trying to bridge multiple
         # regions. Unique within the entire manager UI.
+        #
+        # R12-02 parity gate: every p.expect()/p.expect_exact() regex in
+        # this block (and the rest of main()) is exercised against
+        # tests/fixtures/device-transcripts/yubihsm-manager-tui-prompts.txt
+        # via scripts/tests/test_transcript_parity.sh "Parser 8" block.
         p.expect(r"all wrap keys stored on the YubiHSM", timeout=10)
         time.sleep(0.6)
         # Label-driven menu navigation (C1): never trust the WrapCommand enum

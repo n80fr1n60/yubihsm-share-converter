@@ -1,0 +1,105 @@
+name: Miri
+
+# R12-Phase-D / item #8: miri (Mid-level IR Interpreter) full lib+test
+# run. miri executes the unit-test suite under an interpreter that
+# tracks every memory access; it catches:
+#
+#   * use-after-free
+#   * uninitialised reads
+#   * data races (in `cfg(test)` cross-thread code)
+#   * stacked-borrows / Tree Borrows pointer-aliasing violations
+#   * out-of-bounds writes
+#
+# Tests gated by `#[cfg(not(miri))]` or `#[cfg_attr(miri, ignore)]`:
+#
+#   * `secret::tests::madvise_panic_does_not_leak_alloc` —
+#     deliberately panics in the middle of an unsafe alloc path;
+#     under miri the AllocGuard mechanic is sound but the test's
+#     setup makes the trace noisy.
+#   * `lock_down_process_is_idempotent` — calls `prctl` /
+#     `setrlimit` which miri does not model.
+#   * `recover_makes_at_most_one_heap_alloc` — uses dhat's
+#     global allocator; miri uses its own.
+#   * exhaustive 65 536-pair `mul_branchless_*_exhaustive`,
+#     `mul_commutativity_exhaustive`,
+#     `mul_aes_commutativity_exhaustive`,
+#     `inv_branchless_matches_reference_exhaustive` — too slow
+#     under miri's interpreter (SD-R12-4: 5-minute wall budget).
+#
+# The miri job runs on every push to main + every PR so a UB
+# regression surfaces during code review, not weeks later.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: miri-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # miri-specific flags. -Zmiri-strict-provenance: tight provenance
+  # tracking (catches more UB at the cost of false-positives on
+  # legitimate `as usize` int-to-pointer casts). The codebase has been
+  # validated under strict-provenance; keeping it on locks the
+  # discipline in.
+  MIRIFLAGS: "-Zmiri-strict-provenance"
+
+jobs:
+  miri:
+    name: cargo miri test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install rustup (per-run sha256 verification)
+        env:
+          TOOLCHAIN: nightly
+        run: |
+          set -e
+          # Sidecar pattern (mirrors ci.yml): download rustup-init AND
+          # its sha256 sidecar from the same canonical origin, verify
+          # before exec. miri is a nightly-only component.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Install miri + rust-src
+        run: |
+          set -e
+          rustup component add --toolchain nightly miri rust-src
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: miri
+      - name: cargo miri setup
+        run: cargo +nightly miri setup
+      - name: cargo miri test (lib + bin)
+        # Run the full unit-test suite under miri. --lib covers the
+        # library modules (legacy, parse, resplit, secret); --bin
+        # yubihsm-share-converter covers the main.rs test module. The
+        # `--release` flag mirrors production builds. `--locked`
+        # asserts Cargo.lock is honoured.
+        run: |
+          set -e
+          cargo +nightly miri test \
+            --lib \
+            --bin yubihsm-share-converter \
+            --release \
+            --locked
