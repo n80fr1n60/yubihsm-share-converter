@@ -10,7 +10,7 @@ production Rust GF kernels under `src/legacy.rs` + `src/resplit.rs` are
 
 The Cryptol `:prove` directives in `.github/workflows/cryptol-proofs.yml`
 prove **algebraic identities of the SPEC** (commutativity, associativity,
-distributivity over XOR, inv-round-trip, Lagrange recovery, etc.). They do
+distributivity over XOR, inv-round-trip, etc.). They do
 NOT prove that the Rust impl matches the spec — a spec-vs-implementation
 drift (e.g. a subtle bit-order regression in `legacy::mul`) would be
 invisible at the Cryptol layer: the spec proofs would still return
@@ -81,7 +81,7 @@ rustup toolchain install "$(awk -F '"' '/^channel/ { print $2 }' saw/extracted/r
 ```
 
 **Wrapper exit codes.** `0` = all proofs pass; `1` = counterexample
-or solver failure; `3` = missing prerequisite (Docker / nightly
+or solver failure; `3` = missing prerequisite (Docker / pinned
 rustc); `4` = bitcode build failed; `5` = Docker pull failed.
 
 Expected SAW output on success:

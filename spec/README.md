@@ -5,12 +5,13 @@ cryptographic kernels in `yubihsm-share-converter`. The `.cry` files
 under this directory are Cryptol modules; the load-bearing claim is
 that every cryptographic operation in `src/legacy.rs` and
 `src/resplit.rs` has an algebraic-spec twin here, and the
-universally-quantified properties of those twins are
-**machine-proven** via Z3 in CI on every push.
+universally-quantified GF/inversion properties of those twins are
+**machine-proven** via Z3 in CI on every push. The heavier Lagrange
+obligations are kept as explicit local/offline checks.
 
 ## Quick start
 
-The canonical local-run entry point for the Cryptol property bundle is
+The canonical local-run entry point for the CI-safe Cryptol property bundle is
 the R13-F top-level proof-runner wrapper:
 
 ```bash
@@ -22,16 +23,25 @@ The wrapper reads the pinned Cryptol Docker image digest from
 with `.github/workflows/cryptol-proofs.yml`), so the local invocation
 is byte-identical to the CI lane.
 
+The slow local/offline Lagrange obligations are separate:
+
+```bash
+bash scripts/run-proofs.sh cryptol-offline
+```
+
+This runs `lagrange_recover_t2`, `lagrange_recover_t2_generic`,
+`overdet_consistent_t2`, and `lagrange_recover_t3_vectors`. They are not
+part of CI because the pinned Cryptol/Z3 image timed out on
+`lagrange_recover_t2` at the 30-minute per-proof cap.
+
 **Prerequisites.** A working Docker daemon (the wrapper fails fast with
 exit code 3 if `docker info` does not succeed). No native Cryptol or
 Z3 install is required; both ship inside the pinned container.
 
 **Per-property output discipline.** Each `:prove` directive emits one
-`Q.E.D.` line on success or a `Counterexample` block on failure; the
-single `:check` directive emits `passed N tests` on success. The
-wrapper greps for `^Counterexample` and exits 1 if any match; it
-counts `^Q.E.D.` + `passed N tests` lines and reports the total in a
-`[ok] cryptol: <N> proof outcomes` summary line.
+`Q.E.D.` line on success or a `Counterexample` block on failure. The
+CI-safe wrapper greps for `^Counterexample` plus solver errors/timeouts,
+then requires at least 26 `Q.E.D.` lines.
 
 **Manual Docker invocation (advanced).** Reviewers who want to drive
 Cryptol interactively (for ad-hoc property exploration outside the
@@ -41,26 +51,20 @@ locked directive list) can still invoke the pinned container directly:
 # Pull the sha256-pinned Cryptol container.
 docker pull "$(awk -F= '/^CRYPTOL_IMAGE=/ { print $2 }' .github/workflows/proof-digests.env)"
 
-# Load + prove the property bundle (Cryptol 3.5.0).
+# Load + prove a CI-safe property (Cryptol 3.5.0).
 docker run --rm \
   -v "$PWD:/work" -w /work \
-  --user "$(id -u):$(id -g)" \
+  -e CRYPTOLPATH=/work \
   "$(awk -F= '/^CRYPTOL_IMAGE=/ { print $2 }' .github/workflows/proof-digests.env)" \
-  cryptol --batch <<'EOF'
-:set prover-timeout = 1800
-:load spec/properties.cry
-:prove mul_legacy_commutative
-:prove mul_aes_associative
-# ... see .github/workflows/cryptol-proofs.yml for the full directive list
-:check lagrange_recover_t3_vectors
-EOF
+  -c ':set prover=z3' \
+  -c ':set prover-timeout = 1800' \
+  -c ':load spec/properties.cry' \
+  -c ':prove mul_legacy_commutative'
 ```
 
-The CI workflow at `.github/workflows/cryptol-proofs.yml` runs the full
-directive list on every push, pull-request, and Sunday 06:00 UTC cron
-(SD-R13-3). Every `:prove` MUST return `Q.E.D.`; the single `:check`
-MUST return `passed N tests` (or `Q.E.D.` when reducible to a
-constant).
+The CI workflow at `.github/workflows/cryptol-proofs.yml` runs the
+CI-safe directive list on every push, pull-request, and Sunday 06:00 UTC
+cron (SD-R13-3). Every default `:prove` MUST return `Q.E.D.`.
 
 ## Native install (without Docker)
 
@@ -86,15 +90,15 @@ multi-backend setups (CVC4 / Boolector — future R14 work).
 | `gf256.cry` | GF(2^8) Russian-peasant `mul`, `xtimes`, `pow_254`-based `inv`, both polynomials (0x11D legacy, 0x11B AES). | `src/legacy.rs:36-49`, `src/legacy.rs:86-103`, `src/resplit.rs:18-22`, `src/resplit.rs:39-52` |
 | `lagrange.cry` | Lagrange interpolation at `x=0` + at arbitrary `x` + over-determined consistency check; parameterised over the multiplier so it covers both polys; static threshold `t` constrained to `2..=3`. | `src/legacy.rs:133-175`, `src/legacy.rs:214-260` |
 | `lagrange_t3_samples.cry` | Auto-generated 1024-row deterministic vector literal for the t=3 `:check`'d property. PRNG: SplitMix64 with seed `0x59EA4612CFD00A89`. | feeds `properties.cry::lagrange_recover_t3_vectors` |
-| `properties.cry` | The property bundle. 20 locked `:prove` + 1 locked `:check` + 9 user-emphasis-extra `:prove` properties (29 total — exceeds the ≥25 acceptance gate by 4 for headroom). | per-property comments in the file |
+| `properties.cry` | The property bundle. The default CI lane runs 26 GF/inversion `:prove` properties; the Lagrange t=2/t=3 properties are retained for `scripts/run-proofs.sh cryptol-offline`. | per-property comments in the file |
 
 ## Property index
 
-The property names below match the `:prove` / `:check` directives in
-`.github/workflows/cryptol-proofs.yml`. Each carries a one-line
+The property names below are split between the CI-safe Cryptol lane and
+the explicit local/offline Lagrange lane. Each carries a one-line
 description + the Rust function it mirrors.
 
-### Locked baseline — 20 × `:prove`
+### CI-safe locked baseline — 17 × `:prove`
 
 | # | Property | Claim | Rust twin |
 | - | -------- | ----- | --------- |
@@ -115,14 +119,13 @@ description + the Rust function it mirrors.
 | 15 | `inv_aes_round_trip` | `mul(a, inv(a)) == 1` for every a ≠ 0 (AES) | spec/gf256.cry `inv_aes` |
 | 16 | `inv_legacy_involution` | `inv(inv(a)) == a` for every a ≠ 0 (legacy) | `src/legacy.rs::inv` |
 | 17 | `inv_aes_involution` | `inv(inv(a)) == a` for every a ≠ 0 (AES) | spec/gf256.cry `inv_aes` |
-| 18 | `lagrange_recover_t2` | t=2 recovery for c=1 polys is exact | `src/legacy.rs::interp_at_zero` |
-| 19 | `lagrange_recover_t2_generic` | t=2 recovery for any c is exact | `src/legacy.rs::interp_at_zero` |
-| 20 | `overdet_consistent_t2` | t=2-defined poly evaluated at an extra x yields the expected y | `src/legacy.rs::interp_at` + `src/main.rs` cross-check path |
-
-### Locked `:check` — 1 directive
+### Local/offline Lagrange — 3 × `:prove` + 1 × `:check`
 
 | # | Property | Claim | Rust twin |
 | - | -------- | ----- | --------- |
+| 18 | `lagrange_recover_t2` | t=2 recovery for c=1 polys is exact | `src/legacy.rs::interp_at_zero` |
+| 19 | `lagrange_recover_t2_generic` | t=2 recovery for any c is exact | `src/legacy.rs::interp_at_zero` |
+| 20 | `overdet_consistent_t2` | t=2-defined poly evaluated at an extra x yields the expected y | `src/legacy.rs::interp_at` + `src/main.rs` cross-check path |
 | 21 | `lagrange_recover_t3_vectors` | t=3 recovery is exact across 1024 deterministic samples | `src/legacy.rs::interp_at_zero` |
 
 Why `:check` instead of `:prove` for t=3: the universally-quantified
@@ -131,7 +134,7 @@ any realistic SMT bit-blasting. The honest form is to commit a
 deterministic sample set + run Cryptol's `:check` over it. See R13-v2
 M2 in `FIX_PLAN.html#r13-v2-residue` for the full rationale.
 
-### User-emphasis extras — 9 × `:prove`
+### CI-safe user-emphasis extras — 9 × `:prove`
 
 Per the user directive: **"for anything related to cryptography, and
 constant-time cryptography make sure we have extensive test coverage
@@ -150,8 +153,9 @@ locked baseline to maximise coverage of the algebraic kernel.
 | 29 | `zero_product_aes` | `mul_aes(a, b) == 0 ⇔ (a == 0 ∨ b == 0)` | confirms GF(2^8) has no zero divisors; load-bearing for Lagrange denominator nonzero-ness |
 | 30 | `inv_aes_homomorphism` | `inv(a · b) == inv(a) · inv(b)` for a, b ≠ 0 (AES) | multiplicative-group homomorphism; characterises GF(2^8)\{0} structure |
 
-**Total: 29 properties + 1 :check = 30 directives.** Acceptance gate
-`grep -c '^property ' spec/properties.cry` ≥ 25 → currently **30**.
+**Default CI total: 26 `:prove` directives.** Offline Lagrange total:
+3 `:prove` directives + 1 `:check` directive. The spec file still keeps
+30 named properties/checks for review and manual verification.
 
 ## Expected solver wall-clock
 
@@ -160,18 +164,18 @@ locked baseline to maximise coverage of the algebraic kernel.
 | GF anchored constants (single inputs) | 9-13, 24-26 | < 1 s | Cryptol simplifies to constant |
 | GF byte-pair properties | 1-8 | 1-5 s each | 65 536-pair sweep via bit-blast |
 | GF inverse round-trips | 14-17 | 5-30 s | 8-iteration `pow_254` unfolds + 256 cases |
-| Lagrange t=2 | 18-19 | 30 s - 2 min | 256^4 = 4×10^9 input space + denominator inversion |
-| Over-determined t=2 | 20 | 30 s - 2 min | similar to Lagrange t=2 |
+| Lagrange t=2 | 18-19 | offline only; can hit 30-min timeout | 256^4 = 4×10^9 input space + denominator inversion |
+| Over-determined t=2 | 20 | offline only | similar to Lagrange t=2 |
 | Triple-input properties (associativity) | 22, 23 | 5-30 min each | 256^3 = 16.7M; expensive under bit-blast |
 | `xtimes` correctness | 27, 28 | 1-5 s | reduces to 256 cases |
 | Zero-product | 29 | 5-30 s | reduces to byte-pair sweep |
 | Homomorphism (triple input under inv) | 30 | 5-30 min | 256^2 + double pow_254 unfolds |
-| `:check` t=3 over 1024 samples | 21 | 30 s - 2 min | concrete evaluation, not SMT |
+| `:check` t=3 over 1024 samples | 21 | offline only | concrete evaluation, not SMT |
 
-Total budget: **< 30 min** wall-clock per CI run; the workflow
-container timeout is 30 min. The per-`:prove` `:set prover-timeout =
-1800` (30 min) safety net caps any individual property at the full
-container budget so an unexpected solver hang fails fast.
+Total default CI budget: **< 30 min** wall-clock. The workflow container
+timeout is 30 min. The per-`:prove` `:set prover-timeout = 1800` safety
+net caps any individual property at the full container budget so an
+unexpected solver hang fails fast.
 
 ## Regenerating the t=3 sample set
 

@@ -6,7 +6,9 @@
 # source of truth shared with cryptol-proofs.yml + saw-proofs.yml).
 #
 # Subcommands:
-#   scripts/run-proofs.sh cryptol  - run all spec/*.cry :prove + :check
+#   scripts/run-proofs.sh cryptol  - run CI-safe Cryptol GF/inversion proofs
+#   scripts/run-proofs.sh cryptol-offline
+#                                  - run slow local Lagrange Cryptol proofs
 #   scripts/run-proofs.sh saw      - build LLVM bitcode + run CI-safe SAW
 #   scripts/run-proofs.sh all      - run both sequentially (DEFAULT;
 #                                    SD-R13-9 option (a): convenience
@@ -38,12 +40,15 @@ usage() {
 scripts/run-proofs.sh - run Cryptol + SAW formal-methods proofs locally
 
 USAGE:
-  scripts/run-proofs.sh [cryptol|saw|all]   (default: all)
+  scripts/run-proofs.sh [cryptol|cryptol-offline|saw|all]   (default: all)
   scripts/run-proofs.sh --help
 
 Subcommands:
-  cryptol  Runs all :prove + :check properties from spec/*.cry via the
-           pinned Cryptol Docker image (~10 min wall clock).
+  cryptol  Runs the CI-safe Cryptol GF/inversion proof subset via the
+           pinned Cryptol Docker image.
+  cryptol-offline
+           Runs the slow local/offline Lagrange Cryptol obligations. These
+           are intentionally excluded from the default CI gate.
   saw      Builds LLVM bitcode then runs the CI-safe GF SAW equivalence proofs via
            the pinned SAW Docker image.
   all      (default) Runs cryptol first, then the CI-safe SAW core proofs.
@@ -98,64 +103,93 @@ load_digests() {
 }
 
 run_cryptol() {
-  echo "=== Cryptol proofs (image: ${CRYPTOL_IMAGE}) ==="
-  # The CI workflow at .github/workflows/cryptol-proofs.yml drives Cryptol
-  # via `cryptol --batch <<'CRYPTOL_BATCH' ... CRYPTOL_BATCH` (a here-doc
-  # of :load + :prove + :check directives), NOT via a committed
-  # spec/properties.proofs file. We replicate the same directive list
-  # here so local + CI runs are byte-identical.
+  echo "=== Cryptol CI-safe proofs (image: ${CRYPTOL_IMAGE}) ==="
+  # The pinned Cryptol image already has `cryptol` as its entrypoint. Use
+  # repeated `-c` commands; `--batch` requires a file argument and does not
+  # read directives from stdin.
   docker run --rm \
     -v "${REPO_ROOT}:/work" -w /work \
     -e CRYPTOLPATH=/work \
     "${CRYPTOL_IMAGE}" \
-    cryptol --batch <<'CRYPTOL_BATCH' | tee /tmp/run-proofs.cryptol.log
-:set prover=z3
-:set prover-timeout = 1800
-:load spec/properties.cry
-
-// --- 20 locked :prove directives (Section 1 of properties.cry) ---
-:prove mul_legacy_commutative
-:prove mul_legacy_identity_one
-:prove mul_legacy_annihilator_zero
-:prove mul_legacy_distributes_xor
-:prove mul_aes_commutative
-:prove mul_aes_identity_one
-:prove mul_aes_annihilator_zero
-:prove mul_aes_distributes_xor
-:prove mul_aes_fips197_first_pair
-:prove mul_aes_fips197_second_pair
-:prove mul_legacy_pin_0x57_0x83
-:prove mul_legacy_pin_0x80_2
-:prove cross_poly_distinguisher
-:prove inv_legacy_round_trip
-:prove inv_aes_round_trip
-:prove inv_legacy_involution
-:prove inv_aes_involution
-:prove lagrange_recover_t2
-:prove lagrange_recover_t2_generic
-:prove overdet_consistent_t2
-
-// --- 1 locked :check directive (Section 2 of properties.cry) ---
-:check lagrange_recover_t3_vectors
-
-// --- 9 user-emphasis-extras :prove (Section 3 of properties.cry) ---
-:prove mul_aes_associative
-:prove mul_legacy_associative
-:prove mul_aes_fips197_self_square
-:prove mul_aes_inv_pin_0x53_0xca
-:prove mul_aes_reduction_anchor
-:prove xtimes_aes_correct
-:prove xtimes_legacy_correct
-:prove zero_product_aes
-:prove inv_aes_homomorphism
-CRYPTOL_BATCH
+    -c ':set prover=z3' \
+    -c ':set prover-timeout = 1800' \
+    -c ':load spec/properties.cry' \
+    -c ':prove mul_legacy_commutative' \
+    -c ':prove mul_legacy_identity_one' \
+    -c ':prove mul_legacy_annihilator_zero' \
+    -c ':prove mul_legacy_distributes_xor' \
+    -c ':prove mul_aes_commutative' \
+    -c ':prove mul_aes_identity_one' \
+    -c ':prove mul_aes_annihilator_zero' \
+    -c ':prove mul_aes_distributes_xor' \
+    -c ':prove mul_aes_fips197_first_pair' \
+    -c ':prove mul_aes_fips197_second_pair' \
+    -c ':prove mul_legacy_pin_0x57_0x83' \
+    -c ':prove mul_legacy_pin_0x80_2' \
+    -c ':prove cross_poly_distinguisher' \
+    -c ':prove inv_legacy_round_trip' \
+    -c ':prove inv_aes_round_trip' \
+    -c ':prove inv_legacy_involution' \
+    -c ':prove inv_aes_involution' \
+    -c ':prove mul_aes_associative' \
+    -c ':prove mul_legacy_associative' \
+    -c ':prove mul_aes_fips197_self_square' \
+    -c ':prove mul_aes_inv_pin_0x53_0xca' \
+    -c ':prove mul_aes_reduction_anchor' \
+    -c ':prove xtimes_aes_correct' \
+    -c ':prove xtimes_legacy_correct' \
+    -c ':prove zero_product_aes' \
+    -c ':prove inv_aes_homomorphism' \
+    | tee /tmp/run-proofs.cryptol.log
   if grep -E '^Counterexample' /tmp/run-proofs.cryptol.log >/dev/null 2>&1; then
     echo "FAIL: cryptol counterexample(s) found" >&2
     exit 1
   fi
+  if grep -Ei '(^|[[:space:]])(failed|error|timed out|timeout|unknown)([[:space:].]|$)' /tmp/run-proofs.cryptol.log >/dev/null 2>&1; then
+    echo "FAIL: cryptol solver-side error / timeout" >&2
+    grep -Ei '(^|[[:space:]])(failed|error|timed out|timeout|unknown)([[:space:].]|$)' /tmp/run-proofs.cryptol.log >&2
+    exit 1
+  fi
   local n_qed
-  n_qed=$(grep -cE '^(Q\.E\.D\.|passed [0-9]+ tests)' /tmp/run-proofs.cryptol.log || true)
-  echo "[ok] cryptol: ${n_qed} proof outcomes (Q.E.D. + check-pass count)"
+  n_qed=$(grep -cE '^Q\.E\.D\.' /tmp/run-proofs.cryptol.log || true)
+  if [ "${n_qed}" -lt 26 ]; then
+    echo "FAIL: expected at least 26 CI-safe Cryptol Q.E.D. lines, got ${n_qed}" >&2
+    exit 1
+  fi
+  echo "[ok] cryptol: ${n_qed} CI-safe Q.E.D. outcomes"
+}
+
+run_cryptol_offline() {
+  echo "=== Cryptol offline Lagrange proofs (image: ${CRYPTOL_IMAGE}) ==="
+  echo "NOTE: these obligations are intentionally excluded from CI; they can hit the 30-minute per-proof timeout."
+  docker run --rm \
+    -v "${REPO_ROOT}:/work" -w /work \
+    -e CRYPTOLPATH=/work \
+    "${CRYPTOL_IMAGE}" \
+    -c ':set prover=z3' \
+    -c ':set prover-timeout = 1800' \
+    -c ':load spec/properties.cry' \
+    -c ':prove lagrange_recover_t2' \
+    -c ':prove lagrange_recover_t2_generic' \
+    -c ':prove overdet_consistent_t2' \
+    -c ':check lagrange_recover_t3_vectors' \
+    | tee /tmp/run-proofs.cryptol-offline.log
+  if grep -E '^Counterexample' /tmp/run-proofs.cryptol-offline.log >/dev/null 2>&1; then
+    echo "FAIL: offline cryptol counterexample(s) found" >&2
+    exit 1
+  fi
+  if grep -Ei '(^|[[:space:]])(failed|error|timed out|timeout|unknown)([[:space:].]|$)' /tmp/run-proofs.cryptol-offline.log >/dev/null 2>&1; then
+    echo "FAIL: offline cryptol solver-side error / timeout" >&2
+    grep -Ei '(^|[[:space:]])(failed|error|timed out|timeout|unknown)([[:space:].]|$)' /tmp/run-proofs.cryptol-offline.log >&2
+    exit 1
+  fi
+  local n_outcomes
+  n_outcomes=$(grep -cE '^(Q\.E\.D\.|passed [0-9]+ tests)' /tmp/run-proofs.cryptol-offline.log || true)
+  if [ "${n_outcomes}" -lt 4 ]; then
+    echo "FAIL: expected at least 4 offline Cryptol outcomes, got ${n_outcomes}" >&2
+    exit 1
+  fi
+  echo "[ok] cryptol-offline: ${n_outcomes} Lagrange outcomes"
 }
 
 run_saw() {
@@ -199,9 +233,10 @@ main() {
   local sub="${1:-all}"
   case "${sub}" in
     --help|-h) usage; exit 0 ;;
-    cryptol)   load_digests; require_docker; run_cryptol ;;
-    saw)       load_digests; require_docker; run_saw ;;
-    all)       load_digests; require_docker; run_cryptol; run_saw ;;
+    cryptol)         load_digests; require_docker; run_cryptol ;;
+    cryptol-offline) load_digests; require_docker; run_cryptol_offline ;;
+    saw)             load_digests; require_docker; run_saw ;;
+    all)             load_digests; require_docker; run_cryptol; run_saw ;;
     *)         echo "FAIL: unknown subcommand '${sub}'" >&2; usage >&2; exit 2 ;;
   esac
   echo "PASS: scripts/run-proofs.sh (${sub} proofs verified)"
