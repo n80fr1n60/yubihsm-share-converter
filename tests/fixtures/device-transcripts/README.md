@@ -151,8 +151,6 @@ The methodology lock: **every parser site MUST be exercised against
 the matching fixture in every per-version subdirectory**. A new
 shell-out parser that ships without a corresponding fixture entry +
 parity test block is a regression in the methodology gate itself.
-See `FIX_PLAN.html` anchors `#r12-01`, `#r12-02`, and `#r13-05` for
-the locked policy.
 
 ## Risks & residue
 

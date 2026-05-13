@@ -13,8 +13,7 @@
 // R13-v1 → R13-v2 sequencing note: the goldens are bytes-from-pre-R13
 // `recover_for_fuzz` (deleted in this commit). The post-move
 // `recover()` MUST produce byte-identical bytes; this test is the
-// load-bearing proof of the "pure refactor" claim in FIX_PLAN.html
-// anchor #r13-03.
+// load-bearing guard for the "pure refactor" claim.
 
 use std::path::PathBuf;
 use yubihsm_share_converter::parse::{parse_legacy_share, LegacyShare};

@@ -5,8 +5,7 @@
 # saw_*` wrappers in `saw/extracted/lib.rs` are stable C-ABI symbol
 # seams over the production `yubihsm_share_converter::*` kernels.
 #
-# Workspace-exclusion discipline (FIX_PLAN R13-02 workspace
-# consideration, option (b)): the empty `[workspace]` table below
+# Workspace-exclusion discipline: the empty `[workspace]` table below
 # makes cargo treat this manifest as a separate workspace root, so
 # the parent `Cargo.toml` (which has no `[workspace]` declaration of
 # its own) does NOT auto-include this directory as a member. The

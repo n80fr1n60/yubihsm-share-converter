@@ -23,10 +23,9 @@
 //   m <- llvm_load_module "extracted/proof-target/release/deps/yubihsm_share_converter_saw_extracted.bc";
 // and references the `saw_*` symbol names below directly.
 //
-// `#![no_std]` posture: the FIX_PLAN spec lists `#![no_std]` as an
-// optimisation for SAW LLVM-IR walks (libstd init is friendlier
-// without it). Implementation DEVIATION (documented): we DROP the
-// `#![no_std]` attribute and use libstd. Rationale: a no_std cdylib
+// `#![no_std]` posture: an earlier review note listed `#![no_std]` as an
+// optimisation for SAW LLVM-IR walks. The implementation deliberately
+// keeps libstd. Rationale: a no_std cdylib
 // requires a hand-rolled `#[panic_handler]` and supporting language
 // items, which is non-trivial boilerplate AND opens a per-edition
 // drift surface every quarterly toolchain rotation. SAW's LLVM-IR

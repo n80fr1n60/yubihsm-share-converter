@@ -1,7 +1,7 @@
 // R13-B / item 2 — SAW symbolic Rust↔Cryptol equivalence driver.
 //
 // The driver loads a SINGLE LLVM-bitcode file at a deterministic path
-// (R13-v2 M5: `cargo +<saw-pinned-nightly> rustc --locked --manifest-path
+// (R13-v2 M5: `cargo +1.85 rustc --locked --manifest-path
 // saw/extracted/Cargo.toml --target-dir saw/extracted/proof-target
 // --crate-type cdylib --release -- --emit=llvm-bc` drives the IR build;
 // the bitcode lands at a literal path with no glob expansion and no
@@ -24,7 +24,7 @@
 import "spec/gf256.cry";
 
 // R13-v2 M5: literal path. The CI workflow stage runs
-//   cargo +<saw-pinned-nightly> rustc --locked \
+//   cargo +1.85 rustc --locked \
 //       --manifest-path saw/extracted/Cargo.toml \
 //       --target-dir saw/extracted/proof-target \
 //       --crate-type cdylib --release -- \

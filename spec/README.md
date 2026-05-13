@@ -132,7 +132,7 @@ Why `:check` instead of `:prove` for t=3: the universally-quantified
 space is `256^6 ≈ 2.8×10^14`, which exceeds the container budget under
 any realistic SMT bit-blasting. The honest form is to commit a
 deterministic sample set + run Cryptol's `:check` over it. See R13-v2
-M2 in `FIX_PLAN.html#r13-v2-residue` for the full rationale.
+M2 notes in `spec/properties.cry` for the full rationale.
 
 ### CI-safe user-emphasis extras — 9 × `:prove`
 

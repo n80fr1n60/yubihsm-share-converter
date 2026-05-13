@@ -123,8 +123,8 @@ returns to BLOCKING once the image is reachable again.
 ## 6. SAW driver maintenance notes
 
 * **`#![no_std]` deviation.** `saw/extracted/lib.rs` is deliberately NOT
-  `#![no_std]` (the FIX_PLAN spec listed `#![no_std]` as an optimisation
-  for SAW LLVM-IR walks; the implementer DEVIATED to libstd to avoid
+  `#![no_std]` (an earlier review note listed `#![no_std]` as an optimisation
+  for SAW LLVM-IR walks; the implementation uses libstd to avoid
   panic-handler boilerplate). If a future SAW image regresses on
   libstd-linked bitcode handling, the rotation PR re-introduces
   `#![no_std]` along with a minimal `#[panic_handler]` that calls
