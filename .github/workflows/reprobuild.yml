@@ -44,28 +44,28 @@ env:
 
 jobs:
   build:
-    name: Reproducible build (${{ matrix.distro }} on ${{ matrix.runner }})
-    runs-on: ${{ matrix.runner }}
+    name: Reproducible build (target ${{ matrix.target_distro }}, host ${{ matrix.host_runner }})
+    runs-on: ${{ matrix.host_runner }}
     strategy:
       matrix:
         include:
-          - runner: ubuntu-22.04
-            distro: ubuntu-22.04
+          - host_runner: ubuntu-22.04
+            target_distro: ubuntu-22.04
             container: "ubuntu@sha256:962f6cadeae0ea6284001009daa4cc9a8c37e75d1f5191cf0eb83fe565b63dd7"
-          - runner: ubuntu-24.04
-            distro: ubuntu-22.04
+          - host_runner: ubuntu-24.04
+            target_distro: ubuntu-22.04
             container: "ubuntu@sha256:962f6cadeae0ea6284001009daa4cc9a8c37e75d1f5191cf0eb83fe565b63dd7"
-          - runner: ubuntu-22.04
-            distro: ubuntu-24.04
+          - host_runner: ubuntu-22.04
+            target_distro: ubuntu-24.04
             container: "ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b"
-          - runner: ubuntu-24.04
-            distro: ubuntu-24.04
+          - host_runner: ubuntu-24.04
+            target_distro: ubuntu-24.04
             container: "ubuntu@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b"
-          - runner: ubuntu-22.04
-            distro: debian-13
+          - host_runner: ubuntu-22.04
+            target_distro: debian-13
             container: "debian@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da"
-          - runner: ubuntu-24.04
-            distro: debian-13
+          - host_runner: ubuntu-24.04
+            target_distro: debian-13
             container: "debian@sha256:e2d08da6f42ef4b09b165d55528a12727aeed8240dc9edf888e3ec07e10ef9da"
       fail-fast: false
     container: ${{ matrix.container }}
@@ -105,6 +105,9 @@ jobs:
       - name: Pin SOURCE_DATE_EPOCH from HEAD commit time
         run: |
           set -e
+          # In container jobs GitHub mounts the checkout from the host runner;
+          # Git may see a different owner UID and refuse repository reads.
+          git config --global --add safe.directory "${GITHUB_WORKSPACE:-$PWD}"
           # `git log -1 --format=%ct HEAD` returns the commit timestamp
           # in seconds-since-epoch (UTC). Capturing it once and exporting
           # via GITHUB_ENV makes it visible to every subsequent step,
@@ -125,13 +128,13 @@ jobs:
       - name: Compute sha256 of release binary
         run: |
           set -e
-          sha256sum "target/release/$BIN_NAME" > "sha256-${{ matrix.distro }}-${{ matrix.runner }}.txt"
-          cat "sha256-${{ matrix.distro }}-${{ matrix.runner }}.txt"
+          sha256sum "target/release/$BIN_NAME" > "sha256-${{ matrix.target_distro }}-${{ matrix.host_runner }}.txt"
+          cat "sha256-${{ matrix.target_distro }}-${{ matrix.host_runner }}.txt"
       - name: Upload sha256
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
-          name: sha256-${{ matrix.distro }}-${{ matrix.runner }}
-          path: sha256-${{ matrix.distro }}-${{ matrix.runner }}.txt
+          name: sha256-${{ matrix.target_distro }}-${{ matrix.host_runner }}
+          path: sha256-${{ matrix.target_distro }}-${{ matrix.host_runner }}.txt
           retention-days: 30
 
   compare:
