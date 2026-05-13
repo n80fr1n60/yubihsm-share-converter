@@ -1,0 +1,378 @@
+// R13-A / item 1: PROPERTIES bundle. Every `property` declaration below
+// carries either a `:prove` directive (for solver-tractable universally-
+// quantified facts) or a `:check` directive (for vector-sampled facts
+// whose universally-quantified form would exceed the container SMT
+// budget — see R13-v2 M2 for the t=3 carve-out). The CI workflow runs
+// all `:prove` + `:check` directives on every push.
+//
+// ─── PROPERTY COUNT ROADMAP ────────────────────────────────────────
+//   LOCKED BASELINE (per R13-A v3 plan body, 20 :prove + 1 :check):
+//     mul_legacy_commutative, mul_legacy_identity_one,
+//     mul_legacy_annihilator_zero, mul_legacy_distributes_xor,
+//     mul_aes_commutative, mul_aes_identity_one,
+//     mul_aes_annihilator_zero, mul_aes_distributes_xor,
+//     mul_aes_fips197_first_pair, mul_aes_fips197_second_pair,
+//     mul_legacy_pin_0x57_0x83, mul_legacy_pin_0x80_2,
+//     cross_poly_distinguisher,
+//     inv_legacy_round_trip, inv_aes_round_trip,
+//     inv_legacy_involution, inv_aes_involution,
+//     lagrange_recover_t2, lagrange_recover_t2_generic,
+//     overdet_consistent_t2,
+//     lagrange_recover_t3_vectors (:check, not :prove — M2)
+//
+//   USER-EMPHASIS EXTRAS beyond the locked baseline (per user directive:
+//   "for anything related to cryptography, and constant-time cryptography
+//   make sure we have extensive test coverage to prove what we do and
+//   that it works"). At least 5 extras MUST be present; this file
+//   commits 9 extras for headroom + defence-in-depth coverage:
+//     mul_aes_associative                  — full associativity (mul_aes)
+//     mul_legacy_associative               — full associativity (mul_legacy)
+//     mul_aes_fips197_self_square          — anchor: mul_aes(1,1) = 1
+//     mul_aes_inv_pin_0x53_0xca            — anchor: inv_aes(0x53) = 0xca
+//     mul_aes_reduction_anchor             — explicit poly-reduction anchor
+//     xtimes_aes_correct                   — mul_aes(a,2) == xtimes_aes(a)
+//     xtimes_legacy_correct                — mul_legacy(a,2) == xtimes_legacy(a)
+//     zero_product_aes                     — no zero divisors (AES)
+//     inv_aes_homomorphism                 — inv(a·b) = inv(a)·inv(b)
+//
+//   TOTAL: 20 locked-prove + 1 locked-check + 9 extra-prove = 30 properties.
+//   Acceptance gate: `grep -c '^property ' spec/properties.cry` ≥ 25.
+
+module spec::properties where
+
+import spec::gf256
+import spec::lagrange
+import spec::lagrange_t3_samples
+
+// ════════════════════════════════════════════════════════════════════
+// SECTION 1 — LOCKED BASELINE (20 :prove)
+// ════════════════════════════════════════════════════════════════════
+//
+// ─── GF(2^8) algebraic properties (poly 0x11D — legacy field) ──────────
+//
+// Each property below mirrors a `#[test]` block in the Rust codebase
+// at `src/legacy.rs::tests`. The Cryptol forms are universally
+// quantified over the FULL [8] × [8] input domain (Rust property tests
+// over 256 × 256 = 65 536 inputs are exhaustive at the byte level;
+// Cryptol :prove invocations achieve the same coverage symbolically via
+// Z3 bit-blasting + UN-quantifier elimination).
+
+// LOCKED-1: mul commutativity (legacy). a · b = b · a in any field.
+// Mirrors src/legacy.rs::tests::mul_branchless_matches_reference_exhaustive
+// (which transitively checks commutativity via the table form's
+// log-symmetry).
+mul_legacy_commutative : [8] -> [8] -> Bit
+property mul_legacy_commutative a b = mul_legacy a b == mul_legacy b a
+
+// LOCKED-2: mul identity (legacy). 1 is the multiplicative identity.
+// Mirrors src/legacy.rs::tests::mul_identity_one_is_neutral (line ~386).
+mul_legacy_identity_one : [8] -> Bit
+property mul_legacy_identity_one a =
+    (mul_legacy a 1 == a) /\ (mul_legacy 1 a == a)
+
+// LOCKED-3: mul annihilator (legacy). 0 absorbs every input.
+// Mirrors src/legacy.rs::tests::mul_annihilator_zero_is_absorbing.
+mul_legacy_annihilator_zero : [8] -> Bit
+property mul_legacy_annihilator_zero a =
+    (mul_legacy a 0 == 0) /\ (mul_legacy 0 a == 0)
+
+// LOCKED-4: mul distributes over XOR (legacy). Characteristic-2 form
+// of the standard distributive law. Load-bearing for Lagrange recovery —
+// the interpolation sum `Σ y_i · L_i(0)` relies on this identity to
+// hold for the polynomial-arithmetic to align with the field structure.
+mul_legacy_distributes_xor : [8] -> [8] -> [8] -> Bit
+property mul_legacy_distributes_xor a b c =
+    mul_legacy a (b ^ c) == (mul_legacy a b) ^ (mul_legacy a c)
+
+// ─── GF(2^8) algebraic properties (poly 0x11B — AES/Rijndael) ──────────
+
+// LOCKED-5: mul commutativity (AES). a · b = b · a.
+// Mirrors src/resplit.rs::tests (the equivalent AES-poly property test).
+mul_aes_commutative : [8] -> [8] -> Bit
+property mul_aes_commutative a b = mul_aes a b == mul_aes b a
+
+// LOCKED-6: mul identity (AES). 1 is the multiplicative identity.
+mul_aes_identity_one : [8] -> Bit
+property mul_aes_identity_one a =
+    (mul_aes a 1 == a) /\ (mul_aes 1 a == a)
+
+// LOCKED-7: mul annihilator (AES). 0 absorbs every input.
+mul_aes_annihilator_zero : [8] -> Bit
+property mul_aes_annihilator_zero a =
+    (mul_aes a 0 == 0) /\ (mul_aes 0 a == 0)
+
+// LOCKED-8: mul distributes over XOR (AES). Same load-bearing role as
+// LOCKED-4 but over the AES poly. Used inside `eval_poly` at
+// src/resplit.rs:57-64 (Horner's rule), so the resplit-side polynomial
+// evaluation depends on this property to behave like polynomial
+// arithmetic over GF(2^8).
+mul_aes_distributes_xor : [8] -> [8] -> [8] -> Bit
+property mul_aes_distributes_xor a b c =
+    mul_aes a (b ^ c) == (mul_aes a b) ^ (mul_aes a c)
+
+// ─── FIPS-197 anchored constants + cross-poly distinguisher ────────────
+//
+// FIPS-197 (the AES standard, NIST 2001) gives two anchored byte
+// products in §4.2: 0x57 · 0x83 = 0xC1 and 0x57 · 0x13 = 0xFE. Both
+// are over the AES reduction polynomial 0x11B. These are NOT identities
+// — they are specific witnessed values that anchor the AES poly choice;
+// if a future refactor accidentally changes the reduction polynomial
+// constant (e.g. from 0x1B to 0x1D), these properties trip immediately.
+//
+// The mirror Rust tests live at src/resplit.rs::tests and similar.
+
+// LOCKED-9: FIPS-197 §4.2 first anchor.
+property mul_aes_fips197_first_pair  = mul_aes 0x57 0x83 == 0xC1
+
+// LOCKED-10: FIPS-197 §4.2 second anchor.
+property mul_aes_fips197_second_pair = mul_aes 0x57 0x13 == 0xFE
+
+// LOCKED-11: legacy-poly anchor at the SAME inputs as FIPS-197 §4.2.
+// Confirms the legacy field is NOT the AES field (different reduction
+// poly → different product). Mirrors src/legacy.rs::tests anchors.
+property mul_legacy_pin_0x57_0x83    = mul_legacy 0x57 0x83 == 0x31
+
+// LOCKED-12: legacy-poly reduction anchor. mul_legacy(0x80, 2) walks
+// through the high-bit overflow path → XOR with 0x1D. If the reduction
+// constant ever drifts (e.g. to 0x1B), this trips. Mirrors the
+// xtimes-reduction anchor at src/legacy.rs:292-296.
+property mul_legacy_pin_0x80_2       = mul_legacy 0x80 0x02 == 0x1D
+
+// LOCKED-13: cross-poly distinguisher. The two fields are NOT
+// isomorphic at the byte level — they differ on at least one input,
+// witnessed by 0x57 · 0x83. If a future refactor merges the two `mul`
+// functions into one (e.g. via a shared poly-parameterised body that
+// accidentally collapses the two polys), this property trips.
+property cross_poly_distinguisher    =
+    mul_aes 0x57 0x83 != mul_legacy 0x57 0x83
+
+// ─── Inverse correctness (both polys) ──────────────────────────────────
+
+// LOCKED-14: inv round-trip (legacy). a · a^-1 = 1 for every a /= 0.
+// Mirrors src/legacy.rs::tests inverse-vs-reference exhaustive test
+// (line ~539-572 in the post-R12 codebase).
+inv_legacy_round_trip : [8] -> Bit
+property inv_legacy_round_trip a =
+    (a != 0) ==> mul_legacy a (inv_legacy a) == 1
+
+// LOCKED-15: inv round-trip (AES). a · a^-1 = 1 for every a /= 0.
+inv_aes_round_trip : [8] -> Bit
+property inv_aes_round_trip a =
+    (a != 0) ==> mul_aes a (inv_aes a) == 1
+
+// LOCKED-16: inv involution (legacy). (a^-1)^-1 = a.
+// Captures the "double-inverse returns original" property of the
+// multiplicative group of GF(2^8).
+inv_legacy_involution : [8] -> Bit
+property inv_legacy_involution a =
+    (a != 0) ==> inv_legacy (inv_legacy a) == a
+
+// LOCKED-17: inv involution (AES).
+inv_aes_involution : [8] -> Bit
+property inv_aes_involution a =
+    (a != 0) ==> inv_aes (inv_aes a) == a
+
+// ─── Lagrange recovery correctness, t=2 (solver-tractable: seconds) ──
+
+// LOCKED-18: Lagrange recovery at t=2 with coefficient = 1. Concrete
+// degree-1 polynomial `p(x) = secret + x` is recoverable from any two
+// distinct nonzero x-coords. Mirrors src/legacy.rs:133-175
+// (`legacy::interp_at_zero`).
+lagrange_recover_t2 : [8] -> [8] -> [8] -> Bit
+property lagrange_recover_t2 secret x1 x2 =
+    (x1 != 0 /\ x2 != 0 /\ x1 != x2) ==>
+        interp_at_zero `{t=2} mul_legacy inv_legacy [x1, x2] [y1, y2] == secret
+  where
+    c  = 1
+    y1 = secret ^ (mul_legacy c x1)
+    y2 = secret ^ (mul_legacy c x2)
+
+// LOCKED-19: Lagrange recovery at t=2 with arbitrary coefficient `c`.
+// Generic form — covers the universal `c` so the property is over the
+// full degree-1 polynomial space.
+lagrange_recover_t2_generic : [8] -> [8] -> [8] -> [8] -> Bit
+property lagrange_recover_t2_generic secret c x1 x2 =
+    (x1 != 0 /\ x2 != 0 /\ x1 != x2) ==>
+        interp_at_zero `{t=2} mul_legacy inv_legacy [x1, x2] [y1, y2] == secret
+  where
+    y1 = secret ^ (mul_legacy c x1)
+    y2 = secret ^ (mul_legacy c x2)
+
+// LOCKED-20: Over-determined consistency at t=2 + one extra share.
+// The polynomial defined by (x1, y1) + (x2, y2) evaluated at x3 must
+// equal y3 when y3 is from the same polynomial. Mirrors the over-
+// determined cross-check at src/main.rs (R12-05 cross-check path).
+overdet_consistent_t2 : [8] -> [8] -> [8] -> [8] -> [8] -> Bit
+property overdet_consistent_t2 secret c x1 x2 x3 =
+    (x1 != 0 /\ x2 != 0 /\ x3 != 0 /\
+     x1 != x2 /\ x1 != x3 /\ x2 != x3) ==>
+        overdetermined_consistent `{t=2} mul_legacy inv_legacy
+            [x1, x2] [y1, y2] x3 y3
+  where
+    y1 = secret ^ (mul_legacy c x1)
+    y2 = secret ^ (mul_legacy c x2)
+    y3 = secret ^ (mul_legacy c x3)
+
+// ════════════════════════════════════════════════════════════════════
+// SECTION 2 — LOCKED :check (1 :check)
+// ════════════════════════════════════════════════════════════════════
+//
+// ─── Lagrange recovery correctness, t=3 (vector-sampled, NOT :prove'd) ─
+//
+// R13-v2 M2 — t=3 has a 6-element universal quantifier (secret + c1 +
+// c2 + x1 + x2 + x3); each is [8] = 256 values; total search space
+// 256^6 ≈ 2.8×10^14. Z3 bit-blasting through this is open-ended and
+// would blow the 30-min container budget. The honest form here is:
+//
+//   - t=2 (LOCKED-18..20): full `:prove` against universally-quantified
+//     inputs (solver-tractable in seconds).
+//   - t=3 (LOCKED-21 below): a `:check`-style property evaluated against
+//     a committed deterministic vector set of 1024 samples in
+//     spec/lagrange_t3_samples.cry. Cryptol's `:check` runs the property
+//     against the supplied sample set and reports pass/fail per sample.
+//     This is exhaustively-tested-via-vectors equivalence, NOT machine-
+//     checked symbolic equivalence under SMT — and the plan body +
+//     acceptance gates name this distinction explicitly.
+//
+// The per-sample predicate is `lagrange_recover_t3_at`; the AND-folded
+// :check'd property is `lagrange_recover_t3_vectors` (LOCKED-21).
+
+lagrange_recover_t3_at : [8] -> [8] -> [8] -> [8] -> [8] -> [8] -> Bit
+lagrange_recover_t3_at secret c1 c2 x1 x2 x3 =
+    // Skip degenerate samples (zero x or duplicate x) by returning
+    // True — the corpus filter in lagrange_t3_samples.cry's generator
+    // pre-excludes these so this branch is dead-code on the committed
+    // sample list, but the guard exists as defence-in-depth in case
+    // any future re-generation drops the filter.
+    if (x1 == 0) \/ (x2 == 0) \/ (x3 == 0) \/
+       (x1 == x2) \/ (x1 == x3) \/ (x2 == x3)
+        then True
+        else interp_at_zero `{t=3} mul_legacy inv_legacy
+                 [x1, x2, x3] [y1, y2, y3] == secret
+  where
+    y1 = secret ^ (mul_legacy c1 x1) ^ (mul_legacy c2 (mul_legacy x1 x1))
+    y2 = secret ^ (mul_legacy c1 x2) ^ (mul_legacy c2 (mul_legacy x2 x2))
+    y3 = secret ^ (mul_legacy c1 x3) ^ (mul_legacy c2 (mul_legacy x3 x3))
+
+// LOCKED-21: t=3 Lagrange recovery over committed 1024 deterministic
+// samples. `:check` (NOT `:prove`) runs this property against the
+// `samples_t3` literal in spec/lagrange_t3_samples.cry; success =
+// every sample evaluates to True. Mirrors the t=3 case of
+// `legacy::interp_at_zero` at src/legacy.rs:133-175.
+property lagrange_recover_t3_vectors =
+    foldl (/\) True
+        [ lagrange_recover_t3_at (s @ 0) (s @ 1) (s @ 2) (s @ 3) (s @ 4) (s @ 5)
+        | s <- samples_t3 ]
+
+// ════════════════════════════════════════════════════════════════════
+// SECTION 3 — USER-EMPHASIS EXTRAS (8 extra :prove)
+// ════════════════════════════════════════════════════════════════════
+//
+// Per the user directive: "for anything related to cryptography, and
+// constant-time cryptography make sure we have extensive test coverage
+// to prove what we do and that it works".
+//
+// Each extra below cites the cryptographic claim it underwrites + the
+// Rust function it mirrors (where applicable). The R12-Phase-C
+// precedent: the user demanded 24 crypto tests where the planner had
+// proposed a smaller baseline; this section honours that posture for
+// Cryptol.
+
+// ─── EXTRA-1: associativity (AES poly) ─────────────────────────────────
+//
+// Load-bearing for the AES-poly Horner evaluation at src/resplit.rs:57-64
+// — Horner relies on `mul_aes` being a TRUE field multiplication, which
+// requires associativity. A non-associative multiplication would break
+// the polynomial-evaluation invariant `p(x) = ((c_{t-1}·x + c_{t-2})·x
+// + ...)·x + s` because the parenthesisation would matter.
+//
+// SOLVER NOTE: full associativity over [8]×[8]×[8] = 16.7M inputs may
+// require minutes of Z3 time. Workflow sets `:set prover-timeout = 1800`
+// (30 min) as a per-property safety net.
+mul_aes_associative : [8] -> [8] -> [8] -> Bit
+property mul_aes_associative a b c =
+    mul_aes (mul_aes a b) c == mul_aes a (mul_aes b c)
+
+// ─── EXTRA-2: associativity (legacy poly) ──────────────────────────────
+//
+// Load-bearing for the Lagrange recovery at src/legacy.rs:133-175 —
+// `Σ y_i · Π_{j /= i} x_j` relies on the product Π being associative
+// (and commutative); a non-associative `mul_legacy` would yield
+// parenthesisation-dependent values from the same input set.
+mul_legacy_associative : [8] -> [8] -> [8] -> Bit
+property mul_legacy_associative a b c =
+    mul_legacy (mul_legacy a b) c == mul_legacy a (mul_legacy b c)
+
+// ─── EXTRA-3: FIPS-197 self-square anchor (AES) ────────────────────────
+//
+// mul_aes(1, 1) = 1. Trivially true if `mul_aes` agrees with field
+// multiplication, but a useful smoke-test pin against any future
+// refactor that special-cases either operand. Captures the "identity
+// squared is identity" claim.
+property mul_aes_fips197_self_square = mul_aes 0x01 0x01 == 0x01
+
+// ─── EXTRA-4: inv anchor at 0x53 → 0xCA (AES) ──────────────────────────
+//
+// The canonical inverse-pair pin: in GF(2^8)/0x11B the multiplicative
+// inverse of 0x53 is 0xCA, so mul_aes(0x53, 0xCA) = 1. This is a
+// pre-computed value commonly cited in AES S-box derivations; if the
+// `inv_aes` body drifts (e.g. wrong exponent, wrong bit-walk
+// direction), the bidirectional product trips.
+mul_aes_inv_pin_0x53_0xca : Bit
+property mul_aes_inv_pin_0x53_0xca =
+    (mul_aes 0x53 0xCA == 0x01) /\ (inv_aes 0x53 == 0xCA)
+
+// ─── EXTRA-5: explicit reduction-polynomial anchor (AES) ───────────────
+//
+// mul_aes(0x02, 0x80) = 0x1B. This is the explicit witness that the
+// reduction polynomial is 0x11B — the high bit of 0x80 multiplied by 2
+// overflows into the polynomial-reduction path, leaving the low byte
+// of the reduction polynomial (0x1B) as the result. If the reduction
+// constant is ever accidentally changed to 0x1D (the legacy poly),
+// this trips immediately.
+mul_aes_reduction_anchor : Bit
+property mul_aes_reduction_anchor = mul_aes 0x02 0x80 == 0x1B
+
+// ─── EXTRA-6: xtimes-vs-mul correctness (AES) ──────────────────────────
+//
+// xtimes_aes IS multiplication by 2 in GF(2^8)/0x11B. This property
+// confirms the doubling primitive at src/resplit.rs:18-22 agrees with
+// the full Russian peasant when one operand is 2 — the load-bearing
+// claim that the optimised doubling path doesn't drift from the
+// general-purpose multiply.
+xtimes_aes_correct : [8] -> Bit
+property xtimes_aes_correct a = mul_aes a 0x02 == xtimes_aes a
+
+// ─── EXTRA-7: xtimes-vs-mul correctness (legacy) ───────────────────────
+//
+// Same as EXTRA-6 for the legacy poly. Mirrors `ref_xtimes` at
+// src/legacy.rs:292-296 (which is a #[cfg(test)] reference, but the
+// algebraic identity holds and is load-bearing for the table-form
+// reference's correctness).
+xtimes_legacy_correct : [8] -> Bit
+property xtimes_legacy_correct a = mul_legacy a 0x02 == xtimes_legacy a
+
+// ─── EXTRA-8: zero-product property (no zero divisors, AES) ────────────
+//
+// GF(2^8) is a field → it has no zero divisors. mul(a, b) = 0 if and
+// only if a = 0 or b = 0. This is the contrapositive of multiplicative-
+// closure of nonzero elements; load-bearing for the Lagrange recovery
+// denominator (the product Π (x_i ⊕ x_j) over pairwise-distinct x is
+// guaranteed nonzero, so `inv` is never called on 0 on the hot path
+// at src/legacy.rs:171,256).
+zero_product_aes : [8] -> [8] -> Bit
+property zero_product_aes a b =
+    (mul_aes a b == 0) == ((a == 0) \/ (b == 0))
+
+// ─── EXTRA-9: multiplicative-inverse homomorphism (AES) ────────────────
+//
+// inv(a · b) = inv(a) · inv(b) — the inversion map is a homomorphism
+// of the multiplicative group. Together with `inv_aes_involution`
+// (LOCKED-17), this characterises the multiplicative group structure
+// of GF(2^8)\{0}. Load-bearing for any future caller that combines
+// inverses across multiple inputs (e.g. recovering from a chain of
+// share-products).
+inv_aes_homomorphism : [8] -> [8] -> Bit
+property inv_aes_homomorphism a b =
+    (a != 0 /\ b != 0) ==>
+        inv_aes (mul_aes a b) == mul_aes (inv_aes a) (inv_aes b)

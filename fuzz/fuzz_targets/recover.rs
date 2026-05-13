@@ -1,22 +1,26 @@
 //! R12-Phase-D / item #6: recover-target libFuzzer harness.
 //!
-//! INVARIANT: `recover_for_fuzz` MUST never panic on any input
+//! R13-C / item 3: imports the PRODUCTION `recover()` (now at
+//! `yubihsm_share_converter::recover::recover`) directly — the
+//! prior R12 fuzz-only seam in `src/lib.rs` was deleted as part of
+//! R13-C. The fuzz harness now exercises the IDENTICAL function that
+//! production runs; drift is structurally impossible.
+//!
+//! INVARIANT: `recover` MUST never panic on any input
 //! `(used, payload_len)` where every share's `payload.len() >=
 //! payload_len`. This harness pre-filters parser-rejected lines so the
 //! fuzz input becomes a candidate share set, then asserts the math
 //! kernel (`legacy::interp_at_zero` per byte) returns without panicking.
 //!
 //! Coverage target: the per-byte `legacy::interp_at_zero` loop body
-//! reached from `src/lib.rs::recover_for_fuzz`. Drift between this
-//! seam and production `recover()` would silently invalidate the
-//! coverage — see the doc-comment on `recover_for_fuzz` (lib.rs) for
-//! the lockstep contract and the R13 follow-up (SD-R12-v3-1) that
-//! eliminates the duplication structurally.
+//! reached from `src/recover.rs::recover`. Drift between the harness
+//! and production is now structurally impossible — they share the
+//! same function — eliminating the SD-R12-v3-1 drift surface.
 
 #![no_main]
 use libfuzzer_sys::fuzz_target;
 use yubihsm_share_converter::parse::{parse_legacy_share, LegacyShare};
-use yubihsm_share_converter::recover_for_fuzz;
+use yubihsm_share_converter::recover::recover;
 
 fuzz_target!(|data: &[u8]| {
     // Split fuzz input by newlines; each line is a candidate share.
@@ -45,10 +49,10 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
     // All shares must have at least `payload_len` bytes — otherwise
-    // recover_for_fuzz's defensive guard rejects (which is correct
-    // behaviour, but we don't want to spend fuzz budget on it).
+    // the math kernel would index past the end. Production also enforces
+    // payload_len agreement via the parser/validation pipeline.
     if shares.iter().any(|s| s.payload.len() < payload_len) {
         return;
     }
-    let _ = recover_for_fuzz(&shares, payload_len);
+    let _ = recover(&shares, payload_len);
 });

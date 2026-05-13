@@ -1,0 +1,86 @@
+// R13-A / item 1: Lagrange interpolation at x=0 over GF(2^8). The
+// formal-spec twin of `src/legacy.rs:133-175` (interp_at_zero) and
+// `src/legacy.rs:214-260` (interp_at).
+//
+// The formula in characteristic 2 (subtraction = XOR):
+//
+//   L(0) = Σ y_i · Π_{j /= i} (x_j) / (x_i ⊕ x_j)
+//   L(x) = Σ y_i · Π_{j /= i} (x ⊕ x_j) / (x_i ⊕ x_j)
+//
+// We parameterise the spec over the threshold `t` (statically — Cryptol
+// requires it as a type-level number) and over the multiplier `mul`
+// (poly 0x11D for legacy, 0x11B for AES) so the same spec covers both.
+
+module spec::lagrange where
+
+import spec::gf256
+
+// ─── Lagrange interp at x=0 ──────────────────────────────────────────
+//
+// Computes L(0) for t points {(xs[0], ys[0]), ..., (xs[t-1], ys[t-1])}.
+// Parameterised by `mul` + `invf` so the same body covers both polys.
+//
+// Cross-reference: src/legacy.rs:133-175 (`legacy::interp_at_zero`).
+// The Rust impl uses a Phase-1 duplicate-x scan + Phase-3 evaluation
+// loop; the Cryptol form below collapses both into a single closed-
+// form sum (the `(x1 != 0 /\ x2 != 0 /\ x1 != x2)` precondition in the
+// caller's property statement covers the Phase-1 reject cases).
+interp_at_zero :
+    {t}
+    (fin t, t >= 2, t <= 3)
+    => ([8] -> [8] -> [8])
+    -> ([8] -> [8])
+    -> [t][8]
+    -> [t][8]
+    -> [8]
+interp_at_zero mul invf xs ys =
+    foldl (^) 0 [ mul (ys @ i) (li_zero i) | i <- [0 .. <t] ]
+  where
+    li_zero : [width t] -> [8]
+    li_zero i = mul num (invf den)
+      where
+        num = foldl mul 1 [ if j == i then 1 else xs @ j | j <- [0 .. <t] ]
+        den = foldl mul 1 [ if j == i then 1 else (xs @ i) ^ (xs @ j) | j <- [0 .. <t] ]
+
+// ─── Lagrange interp at arbitrary x ─────────────────────────────────
+//
+// Formal twin of `legacy::interp_at` at src/legacy.rs:214-260. Used by
+// the over-determined cross-check at the resplit callsite (Phase 2 of
+// recover()). Same parameterisation as `interp_at_zero`.
+interp_at :
+    {t}
+    (fin t, t >= 2, t <= 3)
+    => ([8] -> [8] -> [8])
+    -> ([8] -> [8])
+    -> [t][8]
+    -> [t][8]
+    -> [8]
+    -> [8]
+interp_at mul invf xs ys x =
+    foldl (^) 0 [ mul (ys @ i) (li_x i) | i <- [0 .. <t] ]
+  where
+    li_x : [width t] -> [8]
+    li_x i = mul num (invf den)
+      where
+        num = foldl mul 1 [ if j == i then 1 else x ^ (xs @ j) | j <- [0 .. <t] ]
+        den = foldl mul 1 [ if j == i then 1 else (xs @ i) ^ (xs @ j) | j <- [0 .. <t] ]
+
+// ─── Over-determined consistency check ─────────────────────────────
+//
+// Given t points (xs, ys) and one extra point (x_extra, y_extra), the
+// polynomial defined by the first t points evaluated at x_extra must
+// equal y_extra. This is the formal-spec twin of the over-determined
+// check at `src/main.rs` (R12-05 cross-check path) and corresponds to
+// Phase 2 of the recover() pipeline.
+overdetermined_consistent :
+    {t}
+    (fin t, t >= 2, t <= 3)
+    => ([8] -> [8] -> [8])
+    -> ([8] -> [8])
+    -> [t][8]
+    -> [t][8]
+    -> [8]
+    -> [8]
+    -> Bit
+overdetermined_consistent mul invf xs ys x_extra y_extra =
+    interp_at mul invf xs ys x_extra == y_extra

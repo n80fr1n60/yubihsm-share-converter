@@ -1,0 +1,4 @@
+Session keepalive set up to run every 15 seconds
+Created session 0
+Object imported as 0x0042
+Object metadata: domains=1, capabilities=sign-pkcs,sign-ecdsa, generation=0

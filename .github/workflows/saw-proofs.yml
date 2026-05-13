@@ -1,0 +1,219 @@
+name: SAW symbolic equivalence
+
+# R13-B / item 2: SAW symbolic Rust↔Cryptol equivalence lane. Builds the
+# `saw/extracted/proof-target/release/deps/yubihsm_share_converter_saw_extracted.bc` LLVM bitcode at a
+# deterministic literal path (R13-v2 M5) and runs the 3 CI-safe `llvm_verify`
+# directives in `saw/yubihsm-share-converter.saw` against the
+# `#[no_mangle] saw_*` thin wrappers (R13-v2 M6). The driver imports
+# `spec/gf256.cry` and asserts that every
+# verification returns Q.E.D. Failure-policy posture per R13-v2 M8
+# soak-period mechanic (see job-level continue-on-error directive below).
+#
+# R13-F refactor: the pinned SAW Docker image digest is sourced from
+# `.github/workflows/proof-digests.env` (single source of truth shared
+# with `.github/workflows/cryptol-proofs.yml` AND the local-run wrapper
+# `scripts/run-proofs.sh`). The job-level `container:` key was dropped
+# because GitHub Actions evaluates `container.image` BEFORE step
+# expressions resolve; we run SAW + the bitcode build directly on the
+# `ubuntu-24.04` runner where the env file can be sourced.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    # SD-R13-4: Sunday 07:00 UTC slot. Cron-side runs catch SAW image
+    # digest deletion / GHCR rotation within a week; the next-quarter
+    # rotation PR absorbs any drift. See `saw/MAINTENANCE.md` Step 4
+    # for the non-blocking-on-cron posture.
+    - cron: '0 7 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: saw-proofs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  saw-proofs:
+    name: SAW llvm_verify
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    # R13-v2 M8 soak period: starts true for 2 weeks OR 5 PRs (whichever
+    # comes first). Flip mechanism: a dedicated follow-up PR removes the
+    # continue-on-error line below + records the flip in
+    # `saw/MAINTENANCE.md` with the date / PR number / maintainer
+    # sign-off. AFTER the flip, the lane is BLOCKING on PR + NON-BLOCKING
+    # on cron; the cron-side non-blocking posture is achieved via a
+    # separate `if: github.event_name != 'schedule'` guard on the
+    # Q.E.D.-verification step (see `saw/MAINTENANCE.md` Step 4).
+    continue-on-error: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Skip when [skip saw] label is present
+        # R13-v2 M8 maintenance protocol: maintainer can attach the
+        # `[skip saw]` label to a PR to bypass the gate; the PR
+        # description MUST name the justification and the bypass is
+        # logged in the audit trail in `saw/MAINTENANCE.md`. The bypass
+        # is allowed only for justified non-SAW-related changes; review
+        # will REJECT `[skip saw]` on any PR that touches one of the
+        # CI SAW protected paths:
+        #   - src/legacy.rs   (legacy::mul, legacy::inv)
+        #   - src/resplit.rs  (resplit::mul_aes)
+        if: contains(github.event.pull_request.labels.*.name, 'skip saw')
+        run: |
+          echo "::warning::SAW lane bypassed via [skip saw] label; reviewer must verify justification."
+          echo "Bypass logged for audit trail; see saw/MAINTENANCE.md Step 2."
+          exit 0
+
+      - name: Read pinned image digest from single source of truth
+        id: digests
+        # R13-F / item 6: load SAW_IMAGE from the committed
+        # `.github/workflows/proof-digests.env` file. The same env file
+        # is consumed by cryptol-proofs.yml AND scripts/run-proofs.sh so
+        # a single rotation PR updates all three call sites
+        # simultaneously. Rotation cadence: quarterly per
+        # `saw/MAINTENANCE.md` Step 3. The current pin captures the SAW
+        # image digest as of 2026-05-12 via the curl recipe documented
+        # in saw/MAINTENANCE.md.
+        run: |
+          set -e
+          set -a
+          # shellcheck disable=SC1091
+          source .github/workflows/proof-digests.env
+          set +a
+          if [ -z "${SAW_IMAGE:-}" ]; then
+            echo "FATAL: SAW_IMAGE not set after sourcing proof-digests.env" >&2
+            exit 1
+          fi
+          echo "image=${SAW_IMAGE}" >> "${GITHUB_OUTPUT}"
+          echo "Pinned SAW image: ${SAW_IMAGE}"
+
+      - name: Pull pinned SAW image
+        run: |
+          set -e
+          docker pull "${{ steps.digests.outputs.image }}"
+
+      - name: Verify SAW is available inside the container
+        run: |
+          set -e
+          docker run --rm "${{ steps.digests.outputs.image }}" --version || true
+          if ! docker run --rm --entrypoint sh "${{ steps.digests.outputs.image }}" -c 'command -v saw >/dev/null 2>&1'; then
+            echo "FATAL: saw binary not found inside the pinned container." >&2
+            exit 1
+          fi
+
+      - name: Install proof rustc per saw/extracted/rust-toolchain.toml
+        # R13-v2 M7: the `rust-toolchain.toml` at saw/extracted/ names the
+        # concrete Rust proof compiler used to emit LLVM bitcode.
+        # The bitcode build runs on the runner host (not in the SAW
+        # container) because the SAW container ships saw but not the cargo
+        # toolchain the bitcode emit needs.
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE:-$PWD}/saw/extracted"
+          channel=$(awk -F '"' '/^channel/ { print $2 }' rust-toolchain.toml)
+          rustup toolchain install "${channel}" --profile minimal --component rust-src
+          rustup show
+          rustc --version
+          cargo --version
+
+      - name: Build LLVM bitcode at deterministic literal path (R13-v2 M5)
+        # R13-v2 M5: deterministic literal output path; no glob; no
+        # hash-suffix variance. SAW's `llvm_load_module` consumes the
+        # literal proof-target bitcode path below.
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE:-$PWD}"
+          channel=$(awk -F '"' '/^channel/ { print $2 }' saw/extracted/rust-toolchain.toml)
+          cargo +"${channel}" rustc --locked \
+              --manifest-path saw/extracted/Cargo.toml \
+              --target-dir saw/extracted/proof-target \
+              --crate-type cdylib --release -- \
+              --emit=llvm-bc \
+              -C codegen-units=1 \
+              -C opt-level=0 \
+              -C lto=off
+          test -f saw/extracted/proof-target/release/deps/yubihsm_share_converter_saw_extracted.bc
+          ls -la saw/extracted/proof-target/release/deps/yubihsm_share_converter_saw_extracted.bc
+
+      - name: Run SAW core equivalence proofs
+        id: run_saw
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE:-$PWD}"
+          docker run --rm \
+            -e CRYPTOLPATH=/work:/work/spec \
+            -v "${GITHUB_WORKSPACE}:/work" -w /work \
+            "${{ steps.digests.outputs.image }}" \
+            saw/yubihsm-share-converter.saw | tee saw.log
+
+      - name: Verify all llvm_verify directives returned Q.E.D.
+        run: |
+          set -e
+          # Failure modes:
+          #   * "Counterexample" — an `llvm_verify` found a witnessing
+          #     input that falsifies the equivalence. Hard failure.
+          #   * Missing Q.E.D. lines — solver-side error / timeout /
+          #     SAW LLVM-IR walk stall. Hard failure.
+          if grep -E '^Counterexample' saw.log >/dev/null 2>&1; then
+            echo "FATAL: at least one llvm_verify found a counterexample." >&2
+            grep -E '^Counterexample' saw.log >&2
+            exit 1
+          fi
+          successes=$(grep -cE 'Q\.E\.D\.' saw.log || true)
+          echo "SAW Q.E.D. lines: $successes"
+          # The CI driver intentionally targets exactly 3 `llvm_verify`
+          # directives: `saw_legacy_mul`, `saw_resplit_mul_aes`, and
+          # `saw_legacy_inv`. The Lagrange `interp_at_zero` t=2/t=3
+          # wrappers live in `saw/lagrange-offline.saw` for explicit
+          # offline verification with a patched SAW/Crucible stack.
+          if [ "$successes" -ne 3 ]; then
+            echo "FATAL: expected exactly 3 Q.E.D. lines (GF kernels), got $successes." >&2
+            exit 1
+          fi
+          echo "OK: $successes Q.E.D. lines."
+
+      - name: Post results to step summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## SAW equivalence proof results"
+            echo ""
+            echo "Image: \`${{ steps.digests.outputs.image }}\` (sourced from .github/workflows/proof-digests.env)"
+            channel=$(awk -F '"' '/^channel/ { print $2 }' saw/extracted/rust-toolchain.toml)
+            echo "Rust proof compiler: \`${channel}\` (per saw/extracted/rust-toolchain.toml)"
+            echo ""
+            echo "### Q.E.D. lines"
+            echo ""
+            echo '```'
+            grep -E 'Q\.E\.D\.' saw.log || echo '(none — see above for failure mode)'
+            echo '```'
+            echo ""
+            echo "### Counterexamples (must be empty)"
+            echo ""
+            echo '```'
+            grep -E '^Counterexample' saw.log || echo '(none)'
+            echo '```'
+            echo ""
+            echo "### Tail of saw.log"
+            echo ""
+            echo '```'
+            tail -n 60 saw.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload saw.log as artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: saw-proof-log
+          path: saw.log
+          if-no-files-found: warn
+          retention-days: 14

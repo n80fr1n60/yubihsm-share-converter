@@ -1,0 +1,141 @@
+// R13-A / item 1: GF(2^8) formal model for the legacy poly 0x11D and the
+// AES (FIPS-197) poly 0x11B. The Cryptol type model is `[8]` (eight bits)
+// which is byte-isomorphic to Rust's `u8`; the operations below are the
+// formal-spec twins of `src/legacy.rs:36-49` (mul) and `src/resplit.rs:39-52`
+// (mul_aes) and `src/legacy.rs:86-103` (inv).
+//
+// `gf_mul` is parameterised over the reduction polynomial's low byte
+// (0x1D for legacy, 0x1B for AES). The function body is the SAME
+// 8-iteration Russian peasant; only the reduction constant differs.
+
+module spec::gf256 where
+
+// ─── Russian peasant GF(2^8) multiplier ────────────────────────────────
+//
+// 8-iteration Russian peasant GF(2^8) multiplier parameterised by the
+// reduction polynomial's low byte (`poly` ∈ {0x1D, 0x1B}).
+//
+// R13-v2 M3 — Cryptol does NOT support direct numeric pattern overlap
+// like Haskell's `mul_iter 0 acc _ _ = acc` + `mul_iter k acc a b = ...`.
+// The body uses an explicit `if k == 0 then acc else ...` form, which
+// is valid in Cryptol 2.13+ (the version inside the pinned Docker
+// image; 3.5.0 retains the same syntax surface).
+//
+// The loop body is the formal-spec twin of `src/legacy.rs:36-49`
+// — same 8-iteration Russian peasant, parameterised over the poly low-
+// byte (0x1D for legacy, 0x1B for AES). Inside each iteration:
+//   - LSB of `b` drives the accumulate (mask = 0xFF when set, else 0x00)
+//   - MSB of `a` drives the carry-reduce (high_mask = 0xFF when set)
+//   - `acc` XOR-folds the conditional copy of `a`
+//   - `a` shifts left by 1; if the original MSB was set, XOR in `poly`
+//   - `b` shifts right by 1 to inspect the next bit
+gf_mul : [8] -> [8] -> [8] -> [8]
+gf_mul poly a b = mul_iter 8 0 a b
+  where
+    mul_iter : [4] -> [8] -> [8] -> [8] -> [8]
+    mul_iter k acc av bv =
+      if k == 0
+        then acc
+        else mul_iter (k - 1)
+                      (acc ^ (mask && av))
+                      ((av << 1) ^ (high_mask && poly))
+                      (bv >> 1)
+      where
+        // LSB of `bv` drives accumulate; MSB of `av` drives carry-reduce.
+        // Both masks are 0xFF when the bit is set, else 0x00 — matching
+        // the Rust idiom `0u8.wrapping_sub(b & 1)` at src/legacy.rs:41.
+        mask      = if (bv && 1) != 0    then 0xFF else 0x00
+        high_mask = if (av && 0x80) != 0 then 0xFF else 0x00
+
+// ─── Convenience wrappers for the two concrete polynomials ────────────
+//
+// Cross-references:
+//   mul_legacy mirrors `legacy::mul` at src/legacy.rs:36-49 (poly 0x11D
+//                                                   ↔ low byte 0x1D).
+//   mul_aes    mirrors `resplit::mul_aes` at src/resplit.rs:39-52 (poly
+//                                                   0x11B ↔ low byte 0x1B).
+mul_legacy : [8] -> [8] -> [8]
+mul_legacy a b = gf_mul 0x1D a b
+
+mul_aes : [8] -> [8] -> [8]
+mul_aes a b = gf_mul 0x1B a b
+
+// ─── Multiply-by-x (xtimes) branchless GF doubling primitive ───────────
+//
+// Mirrors `ref_xtimes` at src/legacy.rs:292-296 (legacy, poly 0x1D)
+// and `xtimes_aes` at src/resplit.rs:18-22 (AES, poly 0x1B). Used by
+// the `xtimes_correct_*` properties to assert `mul(a, 2) == xtimes(a)`
+// for every a ∈ [8] — i.e. the doubling primitive matches the Russian
+// peasant when one operand is 2.
+xtimes : [8] -> [8] -> [8]
+xtimes poly p = (p << 1) ^ (high_mask && poly)
+  where
+    high_mask = if (p && 0x80) != 0 then 0xFF else 0x00
+
+xtimes_legacy : [8] -> [8]
+xtimes_legacy p = xtimes 0x1D p
+
+xtimes_aes : [8] -> [8]
+xtimes_aes p = xtimes 0x1B p
+
+// ─── Branchless a^254 via 8-iteration square-and-multiply ──────────────
+//
+// Returns the multiplicative inverse for a /= 0; returns 0 for a == 0
+// (the production Rust function errors on a == 0; here we model the
+// pure algebraic kernel and verify the inverse property under the
+// nonzero precondition).
+//
+// R13-v2 M1 — bit-walk direction: LSB-first across 8 iterations,
+// starting with `e = 254 = 0b11111110`. This MUST match the Rust
+// loop at `src/legacy.rs:86-103`:
+//
+//     let mut acc: u8 = 1;
+//     let mut base = a;
+//     let mut e: u8 = 254;
+//     for _ in 0..8 {
+//         let mask = 0u8.wrapping_sub(e & 1);       // LSB drives accumulate
+//         let product = mul(acc, base);
+//         acc = (mask & product) | (!mask & acc);
+//         base = mul(base, base);
+//         e >>= 1;                                  // walk LSB-first
+//     }
+//     Ok(acc)
+//
+// The Cryptol form below uses an explicit `[8]` exponent (not a
+// 4-bit counter) so the 8 iterations are unrolled over the bits of
+// `e` in LSB-first order. The `if e == 0 then ...` form is the Cryptol-
+// 2.13+ pattern (numeric pattern overlap is NOT supported — see M3).
+pow_254 : ([8] -> [8] -> [8]) -> [8] -> [8]
+pow_254 mul a = pow_iter mul 1 a 254
+  where
+    // `acc` accumulates the product; `base` doubles each iteration
+    // (a -> a^2 -> a^4 -> ...). Iteration consumes the LSB of `e`
+    // exactly as the Rust loop does, then shifts `e` right by one.
+    // The recursion terminates when `e == 0` — for `e = 254` this
+    // is precisely 8 iterations (e = 254, 127, 63, 31, 15, 7, 3, 1
+    // -> 0), matching Rust's `for _ in 0..8`.
+    pow_iter : ([8] -> [8] -> [8]) -> [8] -> [8] -> [8] -> [8]
+    pow_iter m acc base e =
+      if e == 0
+        then acc
+        else pow_iter m acc' (m base base) (e >> 1)
+      where
+        product = m acc base
+        // LSB of `e` selects the accumulate this iteration (R13-v2 M1).
+        acc'    = if (e && 1) != 0 then product else acc
+
+// ─── Convenience wrappers for the two concrete inverses ───────────────
+//
+// Cross-references:
+//   inv_legacy mirrors `legacy::inv` at src/legacy.rs:86-103.
+//   inv_aes    is the AES-poly twin (no production Rust caller in this
+//              project — the AES split path goes through `eval_poly` at
+//              src/resplit.rs:57-64, which never inverts — but the
+//              property bundle below verifies the algebraic identity
+//              `mul_aes a (inv_aes a) == 1` for defence-in-depth so the
+//              full GF kernel stack is machine-checked under both polys).
+inv_legacy : [8] -> [8]
+inv_legacy a = pow_254 mul_legacy a
+
+inv_aes : [8] -> [8]
+inv_aes a = pow_254 mul_aes a

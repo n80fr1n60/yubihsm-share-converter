@@ -1,0 +1,50 @@
+// Offline/deep SAW Lagrange equivalence driver.
+//
+// This file is intentionally NOT used by scripts/run-proofs.sh or the
+// CI saw-proofs workflow. The t=2 and t=3 production wrappers exercise
+// Rust slice/iterator/core-library LLVM paths that require patched SAW /
+// Crucible behavior or can be solver-expensive. Keep them as explicit
+// offline verification targets, separate from the CI-safe GF core driver
+// in saw/yubihsm-share-converter.saw.
+
+import "spec/gf256.cry";
+import "spec/lagrange.cry";
+
+m <- llvm_load_module "extracted/proof-target/release/deps/yubihsm_share_converter_saw_extracted.bc";
+
+// Lagrange interp_at_zero (t=2)
+let interp_at_zero_t2_setup = do {
+    x1 <- llvm_fresh_var "x1" (llvm_int 8);
+    x2 <- llvm_fresh_var "x2" (llvm_int 8);
+    y1 <- llvm_fresh_var "y1" (llvm_int 8);
+    y2 <- llvm_fresh_var "y2" (llvm_int 8);
+    llvm_precond {{ x1 != 0 /\ x2 != 0 /\ x1 != x2 }};
+    llvm_execute_func [llvm_term x1, llvm_term x2,
+                       llvm_term y1, llvm_term y2];
+    llvm_return (llvm_term {{
+        interp_at_zero `{t=2} mul_legacy inv_legacy [x1, x2] [y1, y2]
+    }});
+};
+print "Proving Rust saw_interp_at_zero_t2 == spec::lagrange::interp_at_zero ...";
+llvm_verify m "saw_interp_at_zero_t2" [] false interp_at_zero_t2_setup z3;
+
+// Lagrange interp_at_zero (t=3)
+let interp_at_zero_t3_setup = do {
+    x1 <- llvm_fresh_var "x1" (llvm_int 8);
+    x2 <- llvm_fresh_var "x2" (llvm_int 8);
+    x3 <- llvm_fresh_var "x3" (llvm_int 8);
+    y1 <- llvm_fresh_var "y1" (llvm_int 8);
+    y2 <- llvm_fresh_var "y2" (llvm_int 8);
+    y3 <- llvm_fresh_var "y3" (llvm_int 8);
+    llvm_precond {{ x1 != 0 /\ x2 != 0 /\ x3 != 0 /\
+                    x1 != x2 /\ x1 != x3 /\ x2 != x3 }};
+    llvm_execute_func [llvm_term x1, llvm_term x2, llvm_term x3,
+                       llvm_term y1, llvm_term y2, llvm_term y3];
+    llvm_return (llvm_term {{
+        interp_at_zero `{t=3} mul_legacy inv_legacy [x1, x2, x3] [y1, y2, y3]
+    }});
+};
+print "Proving Rust saw_interp_at_zero_t3 == spec::lagrange::interp_at_zero ...";
+llvm_verify m "saw_interp_at_zero_t3" [] false interp_at_zero_t3_setup z3;
+
+print "ALL OFFLINE SAW LAGRANGE EQUIVALENCE PROOFS RETURNED Q.E.D.";

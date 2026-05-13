@@ -1,0 +1,7 @@
+Session keepalive set up to run every 15 seconds
+Created session 0
+Found 4 object(s)
+id: 0x0001, type: authentication-key, algo: aes128-yubico-authentication, sequence: 0, label: DEFAULT AUTHKEY CHANGE THIS ASAP, generation: 0
+id: 0xa5a2, type: wrap-key, algo: aes256-ccm-wrap, sequence: 0, label: Wrap key, generation: 0
+id: 0xc995, type: authentication-key, algo: aes128-yubico-authentication, sequence: 0, label: Application auth key, generation: 0
+id: 0xDEAD, type: authentication-key, algo: aes128-yubico-authentication, sequence: 0, label: my-wrap-key-label, generation: 0

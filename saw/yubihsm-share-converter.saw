@@ -1,0 +1,82 @@
+// R13-B / item 2 — SAW symbolic Rust↔Cryptol equivalence driver.
+//
+// The driver loads a SINGLE LLVM-bitcode file at a deterministic path
+// (R13-v2 M5: `cargo +<saw-pinned-nightly> rustc --locked --manifest-path
+// saw/extracted/Cargo.toml --target-dir saw/extracted/proof-target
+// --crate-type cdylib --release -- --emit=llvm-bc` drives the IR build;
+// the bitcode lands at a literal path with no glob expansion and no
+// hash-suffix variance) and verifies the `saw_*`
+// `#[no_mangle]` thin wrappers (R13-v2 M6) against the corresponding
+// Cryptol spec items in `spec/gf256.cry`.
+//
+// What this proves: operational equivalence in LLVM IR between the
+// production Rust GF kernels under `src/legacy.rs` + `src/resplit.rs`
+// and the formal Cryptol spec under `spec/`. This is the stable CI
+// cross-validation layer for R13: the
+// Cryptol :prove directives in `.github/workflows/cryptol-proofs.yml`
+// prove algebraic identities of the SPEC; the SAW directives below
+// prove that the IMPLEMENTATION matches the SPEC, universally
+// quantified over the full u8 input domain. The Lagrange
+// `interp_at_zero` wrappers live in `saw/lagrange-offline.saw` because
+// their Rust slice/iterator LLVM shape requires patched SAW/Crucible
+// behavior or can be solver-expensive.
+
+import "spec/gf256.cry";
+
+// R13-v2 M5: literal path. The CI workflow stage runs
+//   cargo +<saw-pinned-nightly> rustc --locked \
+//       --manifest-path saw/extracted/Cargo.toml \
+//       --target-dir saw/extracted/proof-target \
+//       --crate-type cdylib --release -- \
+//       --emit=llvm-bc
+// BEFORE `saw` is invoked, so the file at the literal path always
+// exists at SAW-run time. No glob; no hash-suffix variance; no
+// bitcode-extension wildcard substring anywhere in this script.
+m <- llvm_load_module "extracted/proof-target/release/deps/yubihsm_share_converter_saw_extracted.bc";
+
+// ─── GF arithmetic: mul / inv (legacy + AES) ──────────
+//
+// R13-v2 M6: SAW references the `#[no_mangle]` `saw_*` thin wrappers
+// committed under `saw/extracted/lib.rs`. The wrapper symbol names
+// are stable C-ABI names emitted by the rustc compiler directly into
+// the LLVM bitcode — they are NOT subject to the Itanium-ABI
+// mangling that surrounds path-qualified Rust functions (e.g. the
+// un-mangled wrapper `saw_legacy_mul` vs the mangled
+// `_ZN24yubihsm_share_converter6legacy3mul17h<hash>E`). All targets
+// below use the `saw_*` discipline uniformly.
+
+// 1. legacy::mul (poly 0x11D, low byte 0x1D)
+let mul_legacy_setup = do {
+    a <- llvm_fresh_var "a" (llvm_int 8);
+    b <- llvm_fresh_var "b" (llvm_int 8);
+    llvm_execute_func [llvm_term a, llvm_term b];
+    llvm_return (llvm_term {{ mul_legacy a b }});
+};
+print "Proving Rust saw_legacy_mul == spec::gf256::mul_legacy ...";
+llvm_verify m "saw_legacy_mul" [] false mul_legacy_setup z3;
+
+// 2. resplit::mul_aes (poly 0x11B, low byte 0x1B)
+let mul_aes_setup = do {
+    a <- llvm_fresh_var "a" (llvm_int 8);
+    b <- llvm_fresh_var "b" (llvm_int 8);
+    llvm_execute_func [llvm_term a, llvm_term b];
+    llvm_return (llvm_term {{ mul_aes a b }});
+};
+print "Proving Rust saw_resplit_mul_aes == spec::gf256::mul_aes ...";
+llvm_verify m "saw_resplit_mul_aes" [] false mul_aes_setup z3;
+
+// 3. legacy::inv (a^254 via 8-iteration square-and-multiply)
+let inv_legacy_setup = do {
+    a <- llvm_fresh_var "a" (llvm_int 8);
+    llvm_precond {{ a != 0 }};
+    llvm_execute_func [llvm_term a];
+    // The Rust no-mangle wrapper unwraps `Result<u8, &str>` via
+    // `.expect(...)`; under the `a != 0` precondition the production
+    // function is total, so the wrapper returns `u8` directly. SAW
+    // verifies equality of that `u8` with the spec's `inv_legacy a`.
+    llvm_return (llvm_term {{ inv_legacy a }});
+};
+print "Proving Rust saw_legacy_inv == spec::gf256::inv_legacy (nonzero) ...";
+llvm_verify m "saw_legacy_inv" [] false inv_legacy_setup z3;
+
+print "ALL CI SAW CORE EQUIVALENCE PROOFS RETURNED Q.E.D.";

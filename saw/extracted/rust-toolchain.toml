@@ -1,0 +1,18 @@
+# saw/extracted/rust-toolchain.toml — SAW-only Rust proof compiler pin
+# (R13-B / item 2 / R13-v2 M7).
+#
+# R13-v2 M7: Rust 1.85 is pinned for the SAW bitcode build
+#   ghcr.io/galoisinc/saw@sha256:c771f4949415ec0f2c3c4ea54b864a44c9ab7a2b0d822d96998574293552f32f
+# (captured 2026-05-12). This matches the repository MSRV and the
+# manually validated bitcode command used for the CI-safe GF proofs.
+#
+# Rotation cadence: quarterly, per `saw/MAINTENANCE.md` Step 6.5
+# point 3. The rotation PR bundles (a) new SAW image sha256 digest,
+# (b) any intentional proof compiler change, and (c)
+# `saw/MAINTENANCE.md` entry naming the rotation maintainer + SAW
+# release notes URL.
+
+[toolchain]
+channel = "1.85"
+components = ["rustc", "cargo", "rust-src"]
+profile = "minimal"

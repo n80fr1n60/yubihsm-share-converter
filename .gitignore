@@ -4,6 +4,11 @@
 /fuzz/artifacts/
 /fuzz/coverage/
 /fuzz/corpus/
+/saw/extracted/target/
+/saw/extracted/proof-target/
+/saw/extracted/*.bc
+/saw/extracted/*.d
+/saw/extracted/*.so
 
 # Python bytecode and test caches
 __pycache__/

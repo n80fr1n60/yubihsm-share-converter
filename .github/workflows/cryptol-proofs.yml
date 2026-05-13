@@ -1,0 +1,238 @@
+name: Cryptol proofs
+
+# R13-A / item 1: Machine-checked algebraic property proofs against the
+# Cryptol formal model under `spec/`. The workflow loads
+# `spec/properties.cry` (which transitively imports gf256.cry +
+# lagrange.cry + lagrange_t3_samples.cry) and runs 29 `:prove` directives
+# + 1 `:check` directive. The 29 :prove cover GF(2^8) algebraic
+# identities + Lagrange recovery at t=2; the :check covers Lagrange
+# recovery at t=3 over a committed deterministic 1024-sample vector set
+# (per R13-v2 M2 — the t=3 :prove search space 256^6 ≈ 2.8×10^14
+# exceeds the container budget under any realistic SMT bit-blasting).
+#
+# Acceptance posture: workflow exits 0 only if EVERY :prove returns
+# Q.E.D. and the :check passes. Counterexamples, errors, or solver
+# time-outs fail the job hard. Per R13-v2 M2 the per-`:prove` safety
+# net `:set prover-timeout = 1800` caps any single property at 30 min
+# so an unexpected solver hang fails fast rather than starving the
+# 30-min container budget.
+#
+# R13-F refactor: the pinned Cryptol Docker image digest is sourced from
+# `.github/workflows/proof-digests.env` (single source of truth shared
+# with `.github/workflows/saw-proofs.yml` AND the local-run wrapper
+# `scripts/run-proofs.sh`). The job-level `container:` key was dropped
+# because GitHub Actions evaluates `container.image` BEFORE step
+# expressions resolve; we run Cryptol via an explicit `docker run` in a
+# step that has access to the sourced env file.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # SD-R13-3: Sunday 06:00 UTC. Non-blocking against the push/PR lanes
+    # — the cron run validates the GHCR image is still resolvable and
+    # the digest still pulls. If the digest disappears (image deletion
+    # / GHCR rotation), the cron run fails loudly and the maintainer
+    # rotates per the proof-digests.env single-source-of-truth (Phase F).
+    - cron: '0 6 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cryptol-proofs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  cryptol-proofs:
+    name: Cryptol :prove + :check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Read pinned image digest from single source of truth
+        id: digests
+        # R13-F / item 6: load CRYPTOL_IMAGE from the committed
+        # `.github/workflows/proof-digests.env` file. The same env file
+        # is consumed by saw-proofs.yml AND scripts/run-proofs.sh so a
+        # single rotation PR updates all three call sites simultaneously.
+        # Rotation: when a new Cryptol release ships, capture the new
+        # digest via the curl recipe documented in saw/MAINTENANCE.md
+        # and update proof-digests.env in a dedicated PR. The current
+        # pin is Cryptol 3.5.0 (released 2026-01-28); the digest below
+        # is the linux/amd64 manifest digest captured against ghcr.io
+        # on 2026-05-12.
+        run: |
+          set -e
+          set -a
+          # shellcheck disable=SC1091
+          source .github/workflows/proof-digests.env
+          set +a
+          if [ -z "${CRYPTOL_IMAGE:-}" ]; then
+            echo "FATAL: CRYPTOL_IMAGE not set after sourcing proof-digests.env" >&2
+            exit 1
+          fi
+          echo "image=${CRYPTOL_IMAGE}" >> "${GITHUB_OUTPUT}"
+          echo "Pinned Cryptol image: ${CRYPTOL_IMAGE}"
+
+      - name: Pull pinned Cryptol image
+        run: |
+          set -e
+          docker pull "${{ steps.digests.outputs.image }}"
+
+      - name: Verify Cryptol + Z3 are available inside the container
+        run: |
+          set -e
+          docker run --rm "${{ steps.digests.outputs.image }}" cryptol --version || true
+          if ! docker run --rm "${{ steps.digests.outputs.image }}" sh -c 'command -v cryptol >/dev/null 2>&1'; then
+            echo "FATAL: cryptol binary not found inside the pinned container." >&2
+            exit 1
+          fi
+          # Cryptol bundles a usable z3; sanity-print so the workflow
+          # logs name the SMT backend version that discharged the proofs.
+          docker run --rm "${{ steps.digests.outputs.image }}" z3 --version || true
+
+      - name: Run :prove + :check directives
+        id: run_proofs
+        # The CRYPTOLPATH env var tells Cryptol where to find module
+        # files. We pass the repo root so `import spec::gf256` etc.
+        # resolves against ./spec/gf256.cry as documented in the
+        # Cryptol Modules.html reference.
+        run: |
+          set -e
+          cd "${GITHUB_WORKSPACE:-$PWD}"
+          docker run --rm \
+            -v "${GITHUB_WORKSPACE}:/work" -w /work \
+            -e CRYPTOLPATH=/work \
+            "${{ steps.digests.outputs.image }}" \
+            cryptol --batch <<'CRYPTOL_BATCH' | tee proof.log
+          :set prover=z3
+          :set prover-timeout = 1800
+          :load spec/properties.cry
+
+          // ─── 20 locked :prove directives (Section 1 of properties.cry) ─
+          :prove mul_legacy_commutative
+          :prove mul_legacy_identity_one
+          :prove mul_legacy_annihilator_zero
+          :prove mul_legacy_distributes_xor
+          :prove mul_aes_commutative
+          :prove mul_aes_identity_one
+          :prove mul_aes_annihilator_zero
+          :prove mul_aes_distributes_xor
+          :prove mul_aes_fips197_first_pair
+          :prove mul_aes_fips197_second_pair
+          :prove mul_legacy_pin_0x57_0x83
+          :prove mul_legacy_pin_0x80_2
+          :prove cross_poly_distinguisher
+          :prove inv_legacy_round_trip
+          :prove inv_aes_round_trip
+          :prove inv_legacy_involution
+          :prove inv_aes_involution
+          :prove lagrange_recover_t2
+          :prove lagrange_recover_t2_generic
+          :prove overdet_consistent_t2
+
+          // ─── 1 locked :check directive (Section 2 of properties.cry) ──
+          // R13-v2 M2: t=3 is :check'd over 1024 deterministic samples,
+          // NOT :prove'd over the universally-quantified input space.
+          :check lagrange_recover_t3_vectors
+
+          // ─── 9 user-emphasis-extras :prove (Section 3 of properties.cry) ─
+          // Per user directive: "for anything related to cryptography,
+          // and constant-time cryptography make sure we have extensive
+          // test coverage to prove what we do and that it works".
+          :prove mul_aes_associative
+          :prove mul_legacy_associative
+          :prove mul_aes_fips197_self_square
+          :prove mul_aes_inv_pin_0x53_0xca
+          :prove mul_aes_reduction_anchor
+          :prove xtimes_aes_correct
+          :prove xtimes_legacy_correct
+          :prove zero_product_aes
+          :prove inv_aes_homomorphism
+          CRYPTOL_BATCH
+
+      - name: Verify all proofs returned Q.E.D. + checks passed
+        run: |
+          set -e
+          # Failure modes:
+          #   * "Counterexample" — a :prove found a witnessing input that
+          #     falsifies the property. Hard failure.
+          #   * "failed", "error", "Timed out" — solver-side failure.
+          #     Hard failure (the 1800s safety net inside Cryptol caps
+          #     each :prove at 30 min, so any "Timed out" line is a
+          #     deliberate signal that the property is solver-intractable
+          #     at the current container budget).
+          #
+          # Success modes:
+          #   * "Q.E.D." — :prove discharged with no counterexample.
+          #   * "passed N tests" — :check ran the property against the
+          #     sample corpus and every sample evaluated to True.
+          if grep -E '^Counterexample' proof.log >/dev/null 2>&1; then
+            echo "FATAL: at least one :prove found a counterexample." >&2
+            grep -E '^Counterexample' proof.log >&2
+            exit 1
+          fi
+          if grep -Ei '(^|[[:space:]])(failed|error|timed out)([[:space:]]|$)' proof.log >/dev/null 2>&1; then
+            echo "FATAL: solver-side error / timeout in proof.log." >&2
+            grep -Ei '(^|[[:space:]])(failed|error|timed out)([[:space:]]|$)' proof.log >&2
+            exit 1
+          fi
+          # Count successful Q.E.D. + :check lines. The :check directive
+          # prints "passed N tests" (or "Q.E.D." for constant-reducible
+          # properties); :prove prints "Q.E.D.".
+          successes=$(grep -cE '^(Q\.E\.D\.|passed [0-9]+ tests)' proof.log || true)
+          echo "Successful :prove/:check lines: $successes"
+          # We sent 29 :prove + 1 :check = 30 directives. The success
+          # count must be at least 29 (Q.E.D.) + 1 (passed N tests) = 30.
+          # (Cryptol emits one success line per directive.) The gate is
+          # ≥ 30; greater counts indicate the directive list expanded
+          # without the gate being updated.
+          if [ "$successes" -lt 30 ]; then
+            echo "FATAL: expected at least 30 success lines, got $successes." >&2
+            exit 1
+          fi
+          echo "OK: $successes success lines (≥ 30)."
+
+      - name: Post results to step summary
+        if: ${{ always() }}
+        run: |
+          {
+            echo "## Cryptol proof results"
+            echo ""
+            echo "Image: \`${{ steps.digests.outputs.image }}\` (Cryptol 3.5.0; sourced from .github/workflows/proof-digests.env)"
+            echo ""
+            echo "### Success lines"
+            echo ""
+            echo '```'
+            grep -E '^(Q\.E\.D\.|passed [0-9]+ tests)' proof.log || echo '(none — see above for failure mode)'
+            echo '```'
+            echo ""
+            echo "### Counterexamples (must be empty)"
+            echo ""
+            echo '```'
+            grep -E '^Counterexample' proof.log || echo '(none)'
+            echo '```'
+            echo ""
+            echo "### Tail of proof.log"
+            echo ""
+            echo '```'
+            tail -n 40 proof.log || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload proof.log as artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: cryptol-proof-log
+          path: proof.log
+          if-no-files-found: warn
+          retention-days: 14

@@ -181,6 +181,62 @@ key + 8 B reserved headroom for any future format extension. Any
 payload outside `[MIN_PAYLOAD_LEN..=MAX_PAYLOAD_LEN]` is rejected at
 `src/main.rs:443-446`.
 
+### `MAX_PAYLOAD_LEN = 60` rationale (R13-D)
+
+The `MAX_PAYLOAD_LEN` constant at `src/main.rs:309` is hardcoded at
+**60 bytes**, which exceeds the documented maximum (AES-256 wrap-blob
+= 52 bytes) by **8 bytes of slack**. The choice is deliberate:
+
+- **Why slack at all?** The wrap-blob layout above is a SNAPSHOT of
+  the post-R9-H1 YubiHSM2 SDK lineage. A future SDK release could
+  extend the prefix with additional metadata fields (e.g. an audit
+  generation counter, a per-key policy tag, or a reserved bytes
+  field for a future-extensibility pattern that vendors commonly
+  introduce). Hardcoding the cap at exactly 52 would force a
+  same-day source patch + binary release on any such SDK
+  extension; the slack gives an 8-byte cushion for the converter
+  to ACCEPT a slightly-larger payload without modification.
+
+- **Why 8 bytes specifically?** The figure is conservative-arbitrary,
+  not derived from a published vendor commitment. 8 bytes is one
+  big-endian u64, the natural unit for an additional capabilities
+  field, an additional delegated-caps field, or a future audit-
+  generation counter. The choice predates any concrete signal from
+  the SDK roadmap; it is a "round-number-of-fields-of-the-existing-
+  shape" hedge, not a measurement.
+
+- **If a future SDK extends the prefix beyond the slack** (i.e.
+  past 60 B), the converter's `validate_payload_len` check at
+  `src/main.rs:364-371` will fail loudly with the message
+  `share payload <N>B outside legal range [36..=60]`. The
+  remediation is a coordinated source-side update: raise both
+  `MAX_PAYLOAD_LEN` AND `PREFIX_LEN` (currently 20 at `:300`) in
+  lockstep, add unit tests for the new layout, document the new
+  prefix structure in this file, and ship a release. The R13-D
+  policy: **do NOT silently raise the cap without an
+  accompanying spec update in this document**.
+
+- **Tighter alternatives considered, NOT locked.**
+
+  - **Strict cap at 52.** Rejected because a same-day source patch
+    on any future SDK prefix extension is hostile to operators who
+    cannot rebuild on demand (e.g. air-gapped ceremony hosts with
+    pinned binaries). The 8-byte slack absorbs one round of vendor
+    extension before forcing the patch.
+
+  - **Wide cap at 96** (generous-forward-compat; allows up to a
+    44-byte prefix). Rejected because a cap that's too wide
+    weakens the defence-in-depth posture: a corrupted share with
+    an unexpectedly-long payload would be accepted, and the
+    downstream describe_blob `key_len = blob.len() - PREFIX_LEN`
+    check would still mismatch — but a tighter cap fails faster
+    with a more diagnosable error message.
+
+  The chosen 60-byte cap is the planner's "Goldilocks" — generous
+  enough to absorb one vendor extension, tight enough to keep the
+  fail-loud check meaningful. Future R14+ rounds may revisit if
+  YubiHSM SDK roadmap signals a concrete pending change.
+
 All multi-byte fields are big-endian. The byte order matches the wire
 shape that `yubihsm-setup ksp` emits and that `yubihsm-shell put-wrapped`
 consumes, so the converter is byte-transparent on this layer.
@@ -229,3 +285,39 @@ the full list. Crypto-relevant out-of-scope items:
   branchless GF arithmetic defends against cache-timing within a process
   boundary; physical EM/power-trace attacks against the host CPU are
   out of scope.
+
+## 8. Formal Verification (R13)
+
+The cryptographic kernels under `src/legacy.rs`, `src/resplit.rs`, and
+`src/recover.rs` carry a two-layer machine-checked formal-methods
+guarantee:
+
+- **Layer 1 — Cryptol property proofs** (`spec/*.cry`). Algebraic
+  identities of the formal spec (commutativity, associativity,
+  distributivity over XOR, inverse round-trip, Lagrange recovery)
+  proven by Z3 via Cryptol's `:prove`. See `spec/README.md` for the
+  full property index + per-property solver wall-clock estimates.
+
+- **Layer 2 — SAW symbolic Rust↔Cryptol equivalence**
+  (`saw/yubihsm-share-converter.saw`). Three CI-safe `llvm_verify`
+  directives prove that the production Rust GF LLVM bitcode and the
+  Cryptol formal spec agree on every input over the full `u8` domain.
+  The Lagrange `interp_at_zero` t=2/t=3 SAW checks live in
+  `saw/lagrange-offline.saw` for manual/deep verification because they
+  depend on heavier Rust slice/iterator LLVM paths. See `saw/README.md`
+  for the SAW target index + memory/CPU advisory.
+
+**Canonical local-run entry point.** Both proof layers are exposed via
+the top-level wrapper `scripts/run-proofs.sh` (R13-F / item 6):
+
+```bash
+bash scripts/run-proofs.sh cryptol   # Layer 1 only (~10 min)
+bash scripts/run-proofs.sh saw       # Layer 2 CI-safe GF proofs only
+bash scripts/run-proofs.sh all       # both, sequentially (default)
+```
+
+The wrapper reads pinned Docker digests from
+`.github/workflows/proof-digests.env` (single source of truth shared
+with the two CI lanes), so local + CI invocations are byte-identical.
+Cross-references: `spec/README.md` (Cryptol layer detail) and
+`saw/README.md` (SAW layer detail + maintenance protocol).

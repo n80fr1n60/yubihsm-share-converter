@@ -1,0 +1,44 @@
+# saw/extracted/Cargo.toml — SAW-only adapter crate (R13-B / item 2).
+#
+# This crate exists SOLELY to emit LLVM bitcode that SAW's
+# `llvm_load_module` consumes. The `#[no_mangle] pub extern "C" fn
+# saw_*` wrappers in `saw/extracted/lib.rs` are stable C-ABI symbol
+# seams over the production `yubihsm_share_converter::*` kernels.
+#
+# Workspace-exclusion discipline (FIX_PLAN R13-02 workspace
+# consideration, option (b)): the empty `[workspace]` table below
+# makes cargo treat this manifest as a separate workspace root, so
+# the parent `Cargo.toml` (which has no `[workspace]` declaration of
+# its own) does NOT auto-include this directory as a member. The
+# parent `cargo build --release --locked` therefore does NOT try to
+# build this crate; the SAW lane builds it explicitly via
+# `cargo rustc --manifest-path saw/extracted/Cargo.toml ...`.
+[workspace]
+
+[package]
+name = "yubihsm-share-converter-saw-extracted"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "SAW-only no-mangle adapter wrappers over the production yubihsm-share-converter kernels. Not for production use."
+
+[lib]
+# cdylib so rustc emits all `#[no_mangle]` symbols as discrete
+# callable functions in the LLVM bitcode.
+crate-type = ["cdylib"]
+path = "lib.rs"
+
+[dependencies]
+# Path dependency on the parent crate pulls the production kernel
+# bodies (`legacy::mul`, `legacy::inv`, `legacy::interp_at_zero`,
+# `resplit::mul_aes`) into the bitcode transitively. No behavioural
+# fork from production — the `saw_*` wrappers are thin shims.
+yubihsm-share-converter = { path = "../.." }
+
+[profile.release]
+# Same release profile as the parent for SAW-IR shape parity.
+panic = "abort"
+overflow-checks = true
+codegen-units = 1
+lto = "thin"
+debug = false

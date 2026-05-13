@@ -38,6 +38,7 @@ use clap::Parser;
 
 use secret::Secret;
 use yubihsm_share_converter::parse::{parse_legacy_share, LegacyShare};
+use yubihsm_share_converter::recover::recover;
 use yubihsm_share_converter::{legacy, resplit, secret};
 
 // R11-V2-residue (M3 lock-in): swap in dhat's allocator under `#[cfg(test)]`
@@ -306,7 +307,7 @@ const PREFIX_LEN: usize = 20;
 // Raise this and the prefix length together if YubiHSM2 firmware ever
 // extends the capability bitmap past 8 bytes.
 const MAX_INPUT_BYTES: u64 = 16 * 1024;
-const MAX_PAYLOAD_LEN: usize = 60; // 20-byte prefix + AES-256 (32B)
+const MAX_PAYLOAD_LEN: usize = 60; // 20-byte prefix + AES-256 (32B) + 8B slack; see docs/CRYPTO-SPEC.md §5 for rationale
 const MIN_PAYLOAD_LEN: usize = 36; // 20-byte prefix + AES-128 (16B); raise
                                    // in lockstep with MAX if prefix changes.
 
@@ -372,27 +373,11 @@ fn validate_payload_len(payload_len: usize) -> Result<(), String> {
 
 // ───────────────────────────── per-byte recovery ───────────────────────
 //
-// Lagrange-recover each byte position in the legacy field from `used`.
-// Pulled out of `main()` so the disjoint-subset cross-check can call it
-// twice over different subsets of `shares`.
-// R12-C-04: signature drops the `tabs: &legacy::Tables` arg — the
-// `Tables` struct was deleted from production code. `mul`/`inv`/
-// `interp_at[_zero]` no longer take it.
-fn recover(used: &[LegacyShare], payload_len: usize) -> Result<Vec<u8>, String> {
-    let mut blob = Vec::with_capacity(payload_len);
-    for byte_idx in 0..payload_len {
-        // R9-H2: closure-producing-iterator pattern. `used` is captured by
-        // reference; `byte_idx` is captured by copy (usize). Fresh iterator
-        // on every call() — Phase 1 + Phase 3 in interp_at_zero each invoke
-        // it once. No heap allocation; no leak window. The previous
-        // implementation materialised a per-byte `Vec<(u8, u8)>` that held
-        // raw share Y-bytes and was dropped without scrubbing every loop
-        // iteration — the H2 happy-path leak this refactor closes.
-        let make_pts = || used.iter().map(|s| (s.index, s.payload[byte_idx]));
-        blob.push(legacy::interp_at_zero(make_pts)?);
-    }
-    Ok(blob)
-}
+// R13-C / item 3: production `recover()` MOVED to `src/recover.rs` so
+// the fuzz harness can import the production function directly. The
+// pre-R13 local definition + the `recover_for_fuzz` lib wrapper are
+// both deleted; the lib-module import above re-binds the name locally
+// so call sites in main() at :695, :711 are unchanged.
 
 // ───────────────────────────── bounded stdin ───────────────────────────
 //
