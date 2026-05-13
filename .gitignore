@@ -66,6 +66,7 @@ dhat-heap.json
 .idea/
 *.bak
 *.orig
+!/vendor/**/Cargo.toml.orig
 .claude/
 .codex/
 .agents/
