@@ -82,7 +82,8 @@ jobs:
         id: run-mutants
         run: |
           set -e
-          mkdir -p mutants-out
+          out_dir=mutants.out
+          rm -rf "$out_dir" "$out_dir.old"
           # Run mutants; capture exit so a single missed mutant doesn't
           # kill the job (we want to compute the ratio either way).
           set +e
@@ -92,41 +93,40 @@ jobs:
             --timeout 60 \
             --colors never \
             --jobs 2 \
-            --output mutants-out \
+            --output "$out_dir" \
             -- --release --locked
           rc=$?
           set -e
           echo "mutants exit code: $rc"
+          if [ ! -f "$out_dir/outcomes.json" ]; then
+            echo "FATAL: cargo-mutants did not produce $out_dir/outcomes.json; refusing to report a fake 100% kill ratio." >&2
+            exit 1
+          fi
           # mutants emits caught.txt / missed.txt / timeout.txt /
           # unviable.txt in the output dir. Compute the kill ratio.
-          caught=$(wc -l < mutants-out/mutants.out/caught.txt 2>/dev/null || echo 0)
-          missed=$(wc -l < mutants-out/mutants.out/missed.txt 2>/dev/null || echo 0)
-          timeout_=$(wc -l < mutants-out/mutants.out/timeout.txt 2>/dev/null || echo 0)
+          caught=$(wc -l < "$out_dir/caught.txt" 2>/dev/null || echo 0)
+          missed=$(wc -l < "$out_dir/missed.txt" 2>/dev/null || echo 0)
+          timeout_=$(wc -l < "$out_dir/timeout.txt" 2>/dev/null || echo 0)
           # Unviable mutations (those that fail to compile) are
           # excluded from the ratio — they're not real coverage gaps.
           total=$((caught + missed + timeout_))
           if [ "$total" -eq 0 ]; then
-            {
-              echo "kill_ratio=1.0"
-              echo "caught=0"
-              echo "missed=0"
-              echo "timeout=0"
-            } >> "$GITHUB_OUTPUT"
-          else
-            kill_ratio=$(awk "BEGIN {printf \"%.4f\", ($caught + $timeout_) / $total}")
-            {
-              echo "kill_ratio=$kill_ratio"
-              echo "caught=$caught"
-              echo "missed=$missed"
-              echo "timeout=$timeout_"
-            } >> "$GITHUB_OUTPUT"
+            echo "FATAL: cargo-mutants reported zero caught/missed/timeout mutants; treating as a no-op run." >&2
+            exit 1
           fi
+          kill_ratio=$(awk "BEGIN {printf \"%.4f\", ($caught + $timeout_) / $total}")
+          {
+            echo "kill_ratio=$kill_ratio"
+            echo "caught=$caught"
+            echo "missed=$missed"
+            echo "timeout=$timeout_"
+          } >> "$GITHUB_OUTPUT"
       - name: Upload mutants output
         if: always()
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
         with:
           name: mutants-out
-          path: mutants-out/
+          path: mutants.out/
           retention-days: 90
       - name: Check kill-ratio floor
         env:

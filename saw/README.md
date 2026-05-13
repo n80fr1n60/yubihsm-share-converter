@@ -29,11 +29,11 @@ SAW closes that gap for the CI-safe GF kernels. The driver script
 
 Each proof is universally quantified over the full `u8` input domain via
 `llvm_fresh_var` symbolic byte inputs; SAW lowers the LLVM bitcode +
-Cryptol spec to a single SMT query and discharges it via Z3. A `Q.E.D.`
-return means the Rust implementation and the Cryptol spec agree on every
-input; a `Counterexample` return means the SMT solver found a concrete
-input on which they disagree, which would be a release-blocking
-spec-vs-implementation drift.
+Cryptol spec to a single SMT query and discharges it via Z3. A
+`Proof succeeded! <target>` line means the Rust implementation and the
+Cryptol spec agree on every input for that target; a `Counterexample`
+return means the SMT solver found a concrete input on which they disagree,
+which would be a release-blocking spec-vs-implementation drift.
 
 The Lagrange `interp_at_zero` t=2/t=3 SAW wrappers are kept in
 `saw/lagrange-offline.saw` for explicit offline/deep verification. They are
@@ -87,6 +87,9 @@ rustc); `4` = bitcode build failed; `5` = Docker pull failed.
 Expected SAW output on success:
 
 ```
+Proof succeeded! saw_legacy_mul
+Proof succeeded! saw_resplit_mul_aes
+Proof succeeded! saw_legacy_inv
 ALL CI SAW CORE EQUIVALENCE PROOFS RETURNED Q.E.D.
 ```
 
@@ -155,10 +158,12 @@ When a new GF kernel or offline Lagrange wrapper needs a SAW equivalence guard:
    The setup encodes the input shape via `llvm_fresh_var`, any preconditions
    via `llvm_precond`, and the expected return value via the corresponding
    Cryptol expression.
-4. Verify locally per the Docker invocation above; if `Q.E.D.`, commit.
-5. The CI lane expects exactly three core Q.E.D. lines today. If adding a
-   new CI-safe proof, update the expected count in `scripts/run-proofs.sh`
-   and `.github/workflows/saw-proofs.yml` in the same change.
+4. Verify locally per the Docker invocation above; if SAW prints
+   `Proof succeeded! saw_<name>`, commit.
+5. The CI lane expects exactly three core `Proof succeeded! saw_*` lines
+   today. If adding a new CI-safe proof, update the expected count in
+   `scripts/run-proofs.sh` and `.github/workflows/saw-proofs.yml` in the
+   same change.
 
 If the new function is closure-generic or otherwise at the edge of SAW's
 symbolic-execution envelope, keep its SAW proof offline and add a focused

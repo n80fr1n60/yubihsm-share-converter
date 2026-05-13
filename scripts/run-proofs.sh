@@ -25,8 +25,8 @@
 # Environment:
 #   YHSC_PROOF_QUIET=1 - suppress the SAW memory/CPU advisory banner.
 #
-# Output discipline: per-proof status lines (Q.E.D. count + counter-
-# example count + timing); final summary banner of the shape
+# Output discipline: per-proof status lines (Cryptol Q.E.D. count, SAW
+# "Proof succeeded!" count, counterexample count + timing); final summary banner of the shape
 # `PASS: scripts/run-proofs.sh (N proofs verified)` on success.
 
 set -euo pipefail
@@ -220,13 +220,14 @@ run_saw() {
     echo "FAIL: saw counterexample(s) found" >&2
     exit 1
   fi
-  local n_qed
-  n_qed=$(grep -cE 'Q\.E\.D\.' /tmp/run-proofs.saw.log || true)
-  if [ "${n_qed}" -ne 3 ]; then
-    echo "FAIL: expected exactly 3 CI SAW Q.E.D. lines, got ${n_qed}" >&2
+  local n_success
+  n_success=$(grep -cE '^Proof succeeded! saw_(legacy_mul|resplit_mul_aes|legacy_inv)$' /tmp/run-proofs.saw.log || true)
+  if [ "${n_success}" -ne 3 ]; then
+    echo "FAIL: expected exactly 3 CI SAW proof-success lines, got ${n_success}" >&2
+    grep -E '^(Proof succeeded!|Proving Rust|Verifying|Simulating|Checking proof obligations|Stack trace:|Error:)' /tmp/run-proofs.saw.log >&2 || true
     exit 1
   fi
-  echo "[ok] saw: ${n_qed} llvm_verify Q.E.D."
+  echo "[ok] saw: ${n_success} llvm_verify proofs succeeded"
 }
 
 main() {

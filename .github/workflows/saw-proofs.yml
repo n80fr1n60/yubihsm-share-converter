@@ -6,7 +6,7 @@ name: SAW symbolic equivalence
 # directives in `saw/yubihsm-share-converter.saw` against the
 # `#[no_mangle] saw_*` thin wrappers (R13-v2 M6). The driver imports
 # `spec/gf256.cry` and asserts that every
-# verification returns Q.E.D. Failure-policy posture per R13-v2 M8
+# verification returns `Proof succeeded! <target>`. Failure-policy posture per R13-v2 M8
 # soak-period mechanic (see job-level continue-on-error directive below).
 #
 # R13-F refactor: the pinned SAW Docker image digest is sourced from
@@ -48,7 +48,7 @@ jobs:
     # sign-off. AFTER the flip, the lane is BLOCKING on PR + NON-BLOCKING
     # on cron; the cron-side non-blocking posture is achieved via a
     # separate `if: github.event_name != 'schedule'` guard on the
-    # Q.E.D.-verification step (see `saw/MAINTENANCE.md` Step 4).
+    # proof-success verification step (see `saw/MAINTENANCE.md` Step 4).
     continue-on-error: true
     steps:
       - name: Checkout repository
@@ -146,7 +146,7 @@ jobs:
       - name: Run SAW core equivalence proofs
         id: run_saw
         run: |
-          set -e
+          set -euo pipefail
           cd "${GITHUB_WORKSPACE:-$PWD}"
           docker run --rm \
             -e CRYPTOLPATH=/work:/work/spec \
@@ -154,31 +154,32 @@ jobs:
             "${{ steps.digests.outputs.image }}" \
             saw/yubihsm-share-converter.saw | tee saw.log
 
-      - name: Verify all llvm_verify directives returned Q.E.D.
+      - name: Verify all llvm_verify directives succeeded
         run: |
           set -e
           # Failure modes:
           #   * "Counterexample" — an `llvm_verify` found a witnessing
           #     input that falsifies the equivalence. Hard failure.
-          #   * Missing Q.E.D. lines — solver-side error / timeout /
-          #     SAW LLVM-IR walk stall. Hard failure.
+          #   * Missing "Proof succeeded!" lines — solver-side error /
+          #     timeout / SAW LLVM-IR walk stall. Hard failure.
           if grep -E '^Counterexample' saw.log >/dev/null 2>&1; then
             echo "FATAL: at least one llvm_verify found a counterexample." >&2
             grep -E '^Counterexample' saw.log >&2
             exit 1
           fi
-          successes=$(grep -cE 'Q\.E\.D\.' saw.log || true)
-          echo "SAW Q.E.D. lines: $successes"
+          successes=$(grep -cE '^Proof succeeded! saw_(legacy_mul|resplit_mul_aes|legacy_inv)$' saw.log || true)
+          echo "SAW proof-success lines: $successes"
           # The CI driver intentionally targets exactly 3 `llvm_verify`
           # directives: `saw_legacy_mul`, `saw_resplit_mul_aes`, and
           # `saw_legacy_inv`. The Lagrange `interp_at_zero` t=2/t=3
           # wrappers live in `saw/lagrange-offline.saw` for explicit
           # offline verification with a patched SAW/Crucible stack.
           if [ "$successes" -ne 3 ]; then
-            echo "FATAL: expected exactly 3 Q.E.D. lines (GF kernels), got $successes." >&2
+            echo "FATAL: expected exactly 3 SAW proof-success lines (GF kernels), got $successes." >&2
+            grep -E '^(Proof succeeded!|Proving Rust|Verifying|Simulating|Checking proof obligations|Stack trace:|Error:)' saw.log >&2 || true
             exit 1
           fi
-          echo "OK: $successes Q.E.D. lines."
+          echo "OK: $successes SAW proof-success lines."
 
       - name: Post results to step summary
         if: ${{ always() }}
@@ -190,10 +191,10 @@ jobs:
             channel=$(awk -F '"' '/^channel/ { print $2 }' saw/extracted/rust-toolchain.toml)
             echo "Rust proof compiler: \`${channel}\` (per saw/extracted/rust-toolchain.toml)"
             echo ""
-            echo "### Q.E.D. lines"
+            echo "### SAW proof-success lines"
             echo ""
             echo '```'
-            grep -E 'Q\.E\.D\.' saw.log || echo '(none — see above for failure mode)'
+            grep -E '^Proof succeeded! saw_' saw.log || echo '(none — see above for failure mode)'
             echo '```'
             echo ""
             echo "### Counterexamples (must be empty)"
