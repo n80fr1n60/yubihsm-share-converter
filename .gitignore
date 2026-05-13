@@ -44,6 +44,8 @@ htmlcov/
 /keymat-*/
 /out/
 /tmp/
+/crux-build/
+/results/
 /FIX_PLAN.html
 
 # Coverage/profiling artifacts

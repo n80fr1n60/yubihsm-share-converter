@@ -5,7 +5,6 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.85-blue)](Cargo.toml)
 
 > The MSRV badge is static (per `Cargo.toml` `rust-version = "1.85"`); the CI badge resolves once `ci.yml` runs for the first time; the Coveralls badge resolves once the first coverage upload lands (Coveralls auto-onboards on first push — no manual setup required).
-> *Note*: identifiers like `R9-H3` below reference specific iterations of the internal security review and survive in source comments for cross-referencing; `grep -rn 'R9-H3'` from the repo root walks every annotation.
 
 Recover YubiHSM2 wrap-key shares produced by the legacy `yubihsm-setup`
 tool and re-emit them in the format `yubihsm-manager` accepts.
@@ -19,7 +18,7 @@ polynomials** — meaning they operate in *different finite fields*:
 | Tool | Library | GF(2⁸) reduction polynomial | Share encoding |
 |---|---|---|---|
 | `yubihsm-setup` | `rusty-secrets 0.0.2` | **`0x11D`** (Reed-Solomon / CCSDS: `x⁸+x⁴+x³+x²+1`) | `T-N-base64` (70 chars) |
-| `yubihsm-manager` | `vsss-rs 5.x` (manager's bundled lib; this tool no longer depends on it as of R9-H3) | **`0x11B`** (AES / Rijndael: `x⁸+x⁴+x³+x+1`) | `T-X-hex` (72/88/104 chars) |
+| `yubihsm-manager` | `vsss-rs 5.x` (manager's bundled lib; this tool does not depend on it) | **`0x11B`** (AES / Rijndael: `x⁸+x⁴+x³+x+1`) | `T-X-hex` (72/88/104 chars) |
 
 Same elements, different multiplication. The same `(X, Y)` points
 interpolate to **different** secrets in each field. On top of that, the
@@ -38,8 +37,8 @@ shares on paper will hit a wall.
    capabilities | delegated | aes_key`).
 3. Sanity-checks the recovered structure (key length must be 16/24/32
    bytes; prefix must be 20 bytes).
-4. With `--resplit`, re-splits the recovered blob using a hand-rolled
-   `0x11B` GF(2^8) Shamir splitter (R9-H3) and prints `T-X-hex` shares
+4. With `--resplit`, re-splits the recovered blob using a local
+   `0x11B` GF(2^8) Shamir splitter and prints `T-X-hex` shares
    the manager accepts.
 
 **Recovery is cross-checked when redundancy is available**: when more than `t`
@@ -57,7 +56,7 @@ should be used to confirm decode without emitting new shares.
 ```sh
 cargo build --release
 cargo test --release          # offline unit + integration tests
-scripts/tests/lint.sh         # fmt + clippy -D warnings (R4-2 lint gate)
+scripts/tests/lint.sh         # fmt + clippy -D warnings
 
 # convert and re-split for yubihsm-manager (writes shares to stdout —
 # the converter refuses by default unless stdout is a TTY OR BOTH
@@ -120,7 +119,7 @@ equality** — there is no way to fake it short of breaking AES-CCM.
 export OUT_DIR=/dev/shm/keymat-$$
 ./scripts/stage_legacy_setup.sh
 
-# 2. convert the legacy shares (R4-3 dual-knob disk-stdout gate refuses
+# 2. convert the legacy shares (the dual-knob disk-stdout gate refuses
 #    output redirects unless BOTH the env-var is set in a history-safe
 #    shell AND `--i-accept-disk-output` is passed on the command line —
 #    see the operational hardening section below for `set +o history`
@@ -132,7 +131,7 @@ cargo run --release -- --resplit --i-accept-disk-output \
 
 # 3. drive yubihsm-manager (pexpect on its cliclack TUI) to re-create
 #    the wrap-key from the converted shares. YHM_SHARES_FILE is
-#    required (E-M1(a) hard-fail: refuses to default to /tmp/converted.txt
+#    required (hard-fails if unset; refuses to default to /tmp/converted.txt
 #    because a same-UID attacker could pre-plant it).
 YHM_SHARES_FILE="$OUT_DIR/converted.txt" \
     ./scripts/drive_manager.py
@@ -228,7 +227,7 @@ rm -f "$OUT_DIR"/{converted.txt,legacy.txt,legacy_setup_raw.log,\
 #    - SSH-agent forwarding: turn it OFF for this session
 #      (`ssh -a` or remove ForwardAgent from ~/.ssh/config for this host).
 
-# 7. Disk-redirect from the converter goes through a R4-3 DUAL-KNOB gate
+# 7. Disk-redirect from the converter goes through a DUAL-KNOB gate
 #    that requires BOTH the env-var AND a per-invocation CLI flag. The
 #    env-var (`YHSC_ALLOW_DISK_STDOUT=1`) is the historic single-knob
 #    gate, kept for compatibility; the CLI flag (`--i-accept-disk-output`)
@@ -262,7 +261,7 @@ export HISTCONTROL=ignorespace
 operator-trusted host, no network surface. Timing side-channels are NOT
 in scope: the converter performs lookup-table GF arithmetic (non-constant-time
 by design), and the over-determined cross-check uses an early-return on the
-first byte mismatch (R4-5). An attacker with sub-microsecond timing access on
+first byte mismatch. An attacker with sub-microsecond timing access on
 a co-located process could in principle learn corruption-byte positions, but
 this is acceptable given the threat model. The disjoint cross-check (`n ≥ 2t`)
 does use `constant_time_eq` over the full blob.
@@ -284,13 +283,11 @@ material.
   to unmask. `--inspect-only` recovers and validates the blob without
   ever printing key material; use it as a "did my shares round-trip?"
   check before committing to a full `--resplit`.
-* R9-H3 (this round): the previously-large transitive tree driven by
-  `vsss-rs`'s elliptic-curve features has been dropped — the resplit
-  path now uses ~80 LoC of local `0x11B` Shamir (see `mod resplit` in
-  `src/main.rs`). The recovered-blob bit-identity guarantee is
-  preserved (verified by the FIPS-197 `mul_aes` tests + the
-  production-parameter round-trip in M-7), at the cost of carrying
-  ~80 LoC of audit-surface arithmetic instead of a 75-crate dep tree.
+* The previously-large transitive tree driven by `vsss-rs`'s elliptic-curve
+  features has been dropped. The resplit path uses a small local `0x11B`
+  Shamir implementation instead. The recovered-blob bit-identity guarantee
+  is preserved by the FIPS-197 `mul_aes` tests and production-parameter
+  round-trip tests.
 * Exit code 12 means the in-process hardening syscalls
   (`prctl(PR_SET_DUMPABLE, 0)` or `setrlimit(RLIMIT_CORE, {0,0})`)
   failed — typically because seccomp / namespace / LSM policy is
@@ -307,8 +304,8 @@ material.
   The converter refuses on this path BEFORE running recovery, so
   the secret is never reconstructed in process memory. Re-run with
   `--inspect-only` to confirm recovery without emitting new shares,
-  or collect at least `t+1` shares to enable verification (R4-5
-  byte-wise over-determined Lagrange check on the extra shares).
+  or collect at least `t+1` shares to enable byte-wise over-determined
+  Lagrange verification on the extra shares.
 
 ## Flags
 
@@ -316,16 +313,16 @@ The converter has three mutually-exclusive **mode flags** plus one **enabler fla
 
 | Flag | Type | Description |
 |---|---|---|
-| `--resplit` | mode | Recover the legacy shares, then re-emit them in the GF poly `0x11B` format that `yubihsm-manager` accepts (split via the hand-rolled `mod resplit`; R9-H3). The recovered AES key itself is masked on stderr; only the new shares go to stdout. |
+| `--resplit` | mode | Recover the legacy shares, then re-emit them in the GF poly `0x11B` format that `yubihsm-manager` accepts. The recovered AES key itself is masked on stderr; only the new shares go to stdout. |
 | `--inspect-only` | mode | Recover the legacy shares and print only structural diagnostics (wrap-id, domains, capabilities, delegated capabilities, AES key length). No key bytes and no new shares are emitted. The safe "did my shares decode?" check. |
 | `--show-key` | mode | Recover the legacy shares and print the AES key hex to stderr. By default key bytes are masked (per H3 mask-by-default); this flag explicitly opts in to printing them. |
-| `--i-accept-disk-output` | enabler | Required IN ADDITION to `YHSC_ALLOW_DISK_STDOUT=1` to open the disk-stdout gate (R4-3 dual-knob). Combines with any of the three mode flags. On `--inspect-only` it is operationally a no-op (no key-bearing output is produced). |
+| `--i-accept-disk-output` | enabler | Required IN ADDITION to `YHSC_ALLOW_DISK_STDOUT=1` to open the dual-knob disk-stdout gate. Combines with any of the three mode flags. On `--inspect-only` it is operationally a no-op (no key-bearing output is produced). |
 
 **Mutual exclusion**: `--resplit`, `--inspect-only`, and `--show-key` form a three-way exclusion via clap's `conflicts_with_all`. Passing any two together is rejected by the argument parser before any other code runs (clap exit code 2).
 
 **Default behaviour with no mode flag**: the converter recovers and prints the same masked structural diagnostics as `--inspect-only` would — but without the explicit "I am inspecting" intent, future operator-tooling may be ambiguous about purpose. Prefer `--inspect-only` for that case.
 
-**Disk-stdout gate (R4-3)**: a key-bearing stream (`--resplit` to stdout, or `--show-key` to stderr) that is non-tty (pipe / file / redirect) is refused unless BOTH:
+**Disk-stdout gate**: a key-bearing stream (`--resplit` to stdout, or `--show-key` to stderr) that is non-tty (pipe / file / redirect) is refused unless BOTH:
 1. `YHSC_ALLOW_DISK_STDOUT=1` is set in the environment, AND
 2. `--i-accept-disk-output` is passed on the command line.
 
@@ -337,9 +334,9 @@ The converter reads three environment variables. The first two are gates; the th
 
 | Variable | Lexicon | Purpose |
 |---|---|---|
-| `YHSC_ALLOW_DISK_STDOUT` | `1` or `true` (case-insensitive, after `trim`) — anything else (including `0`, `false`, `yes`, `on`, empty, unset) is treated as **disabled** | Half of the dual-knob disk-stdout gate (R4-3). Required IN ADDITION to `--i-accept-disk-output` to redirect a key-bearing stream to a non-tty (file / pipe). The narrow lexicon (M-3-1) prevents the `=0` "intuitively disabled" footgun from accidentally engaging the override. |
+| `YHSC_ALLOW_DISK_STDOUT` | `1` or `true` (case-insensitive, after `trim`) — anything else (including `0`, `false`, `yes`, `on`, empty, unset) is treated as **disabled** | Half of the dual-knob disk-stdout gate. Required IN ADDITION to `--i-accept-disk-output` to redirect a key-bearing stream to a non-tty (file / pipe). The narrow lexicon prevents the `=0` "intuitively disabled" footgun from accidentally engaging the override. |
 | `YHSC_ALLOW_UNHARDENED` | `1` or `true` (same lexicon) | **Dev / test only — DO NOT use for real key material.** The converter requires Linux for its hardening posture (`prctl(PR_SET_DUMPABLE, 0)`, `setrlimit(RLIMIT_CORE)`, `MADV_DONTDUMP`). On macOS / Windows the converter aborts with exit 10 unless this var is set, allowing CI / development on non-Linux. |
-| `HISTCONTROL` / `HISTFILE` | shell-standard | Read by the history-safety gate (R4-3 critical scoping fix: this gate is single-knob and intentionally NOT coupled to `--i-accept-disk-output`). If `YHSC_ALLOW_DISK_STDOUT=1` is set in a shell whose history would record the assignment, the converter aborts with exit 8 BEFORE reading any shares. |
+| `HISTCONTROL` / `HISTFILE` | shell-standard | Read by the history-safety gate; this gate is single-knob and intentionally NOT coupled to `--i-accept-disk-output`. If `YHSC_ALLOW_DISK_STDOUT=1` is set in a shell whose history would record the assignment, the converter aborts with exit 8 BEFORE reading any shares. |
 
 **Three accepted ways to satisfy the history-safety gate** (any one works):
 
@@ -351,7 +348,7 @@ The converter reads three environment variables. The first two are gates; the th
 
 The shell-history gate is read-only on the env-vars; the converter does NOT rewrite or unset them. The operator's environment is responsible for keeping the assignments out of `~/.bash_history`. See exit codes 6, 8, 10 in the [Exit codes](#exit-codes) table.
 
-**Threat model boundary** (R4-3): the dual-knob (`YHSC_ALLOW_DISK_STDOUT` env-var + `--i-accept-disk-output` CLI flag) defeats env-only injection vectors (`.bashrc`, `ssh SetEnv`, `sudo env_keep`, container `-e`, parent-process setenv-before-exec). It does NOT defeat a fully-compromised parent shell that supplies BOTH knobs (e.g. a malicious wrapper script). Run on a host you trust.
+**Threat model boundary**: the dual-knob (`YHSC_ALLOW_DISK_STDOUT` env-var + `--i-accept-disk-output` CLI flag) defeats env-only injection vectors (`.bashrc`, `ssh SetEnv`, `sudo env_keep`, container `-e`, parent-process setenv-before-exec). It does NOT defeat a fully-compromised parent shell that supplies BOTH knobs (e.g. a malicious wrapper script). Run on a host you trust.
 
 ## Exit codes
 
@@ -362,16 +359,16 @@ The converter binary uses 13 distinct exit codes; the supporting scripts add a f
 | 0 | success | Recovery + (optional) re-split + (optional) describe-blob completed cleanly. |
 | 2 | parse error | Stdin line failed `T-N-base64` parse, or stdin exceeded the 16 KiB cap, or threshold/index outside `2..=31` / `1..=255`, or payload length outside `[36..60]` bytes. |
 | 3 | recovery error | `legacy::interp_at_zero` returned an error (duplicate-x, x=0, or `inv(0)`), or recovered blob length is wrong, or `describe_blob` rejected the recovered AES key length. |
-| 4 | cross-check failure | Either the disjoint-subset check (`n ≥ 2t`) recovered different blobs from the two halves, OR the over-determined Lagrange check (`t < n < 2t`, R4-5) found a share whose payload doesn't fit the polynomial. No key is emitted. |
+| 4 | cross-check failure | Either the disjoint-subset check (`n ≥ 2t`) recovered different blobs from the two halves, OR the over-determined Lagrange check (`t < n < 2t`) found a share whose payload doesn't fit the polynomial. No key is emitted. |
 | 5 | stdout write failure | Re-emitted shares failed to write to stdout (pipe closed, disk full, etc.). |
-| 6 | disk-stdout gate refusal | A key-bearing stream is non-tty AND the dual-knob (`YHSC_ALLOW_DISK_STDOUT=1` env-var **and** `--i-accept-disk-output` CLI flag) was not supplied. R4-3 dual-knob; the env-var alone or flag alone is insufficient. |
-| 7 | resplit split failed | `--resplit` invoked the hand-rolled `resplit::split` (R9-H3) and it returned an error (rare; bad parameters or RNG exhaustion). |
-| 8 | history-safety gate refusal | `YHSC_ALLOW_DISK_STDOUT=1` was set in a shell whose history would record the assignment. The gate refuses regardless of the new CLI flag (R4-3 critical scoping fix: history gate is single-knob, intentionally). Mitigations: `set +o history`, `HISTCONTROL=ignorespace` (with leading-space invocation), or `unset HISTFILE`. |
+| 6 | disk-stdout gate refusal | A key-bearing stream is non-tty AND the dual-knob (`YHSC_ALLOW_DISK_STDOUT=1` env-var **and** `--i-accept-disk-output` CLI flag) was not supplied. The env-var alone or flag alone is insufficient. |
+| 7 | resplit split failed | `--resplit` invoked the local `resplit::split` implementation and it returned an error (rare; bad parameters or RNG exhaustion). |
+| 8 | history-safety gate refusal | `YHSC_ALLOW_DISK_STDOUT=1` was set in a shell whose history would record the assignment. The gate refuses regardless of the new CLI flag. Mitigations: `set +o history`, `HISTCONTROL=ignorespace` (with leading-space invocation), or `unset HISTFILE`. |
 | 9 | `--resplit` n > 9 | The yubihsm-manager wire format caps the share index at 9; re-emitting more would produce shares the manager refuses to import. |
 | 10 | non-Linux without override | The hardening syscalls (`prctl`, `setrlimit`, `MADV_DONTDUMP`) are Linux-specific. macOS / Windows abort here unless `YHSC_ALLOW_UNHARDENED=1` is set (dev/test only — DO NOT use for real key material). |
 | 11 | resplit X out-of-range | `--resplit` produced a share whose X coordinate is outside `[1..9]`. Defensive sanity check; never observed in practice. |
-| **12** | **`lock_down_process` syscall failure (R4-6)** | `prctl(PR_SET_DUMPABLE, 0)` or `setrlimit(RLIMIT_CORE, {0,0})` returned non-zero (e.g. blocked by seccomp / namespace / LSM policy). The hardening did NOT take effect; the process aborts before any stdin read so no key material can be exposed. The error names the failed syscall and surfaces errno via `io::Error::last_os_error()`. |
-| **13** | **`--resplit` n == t refusal (R4-5)** | Minimum-redundancy ceremonies (e.g. 2-of-2) provide no shares for cross-checking. The converter refuses to re-emit potentially-corrupt shares. The refusal happens **before** any `recover()` call, so the secret never enters process memory on this path. Use `--inspect-only` to confirm recovery without emitting new shares. |
+| **12** | **`lock_down_process` syscall failure** | `prctl(PR_SET_DUMPABLE, 0)` or `setrlimit(RLIMIT_CORE, {0,0})` returned non-zero (e.g. blocked by seccomp / namespace / LSM policy). The hardening did NOT take effect; the process aborts before any stdin read so no key material can be exposed. The error names the failed syscall and surfaces errno via `io::Error::last_os_error()`. |
+| **13** | **`--resplit` n == t refusal** | Minimum-redundancy ceremonies (e.g. 2-of-2) provide no shares for cross-checking. The converter refuses to re-emit potentially-corrupt shares. The refusal happens **before** any `recover()` call, so the secret never enters process memory on this path. Use `--inspect-only` to confirm recovery without emitting new shares. |
 
 ## Layout
 
