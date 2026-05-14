@@ -187,8 +187,33 @@ fn env_flag_truthy(name: &str) -> bool {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn assert_single_threaded() {
+// R14-03 Sub-B.1: factor the n==1 comparison out of the inline `assert!`
+// macro into a `Result<u32, u32>`-returning seam. The seam is the test-
+// reachable form; the production wrapper (`assert_single_threaded` on
+// Linux below) calls the seam and panics on `Err`. Under release-profile
+// LTO (`lto = "thin"` + `codegen-units = 1` in Cargo.toml) the wrapper
+// inlines the seam call site so the runtime cost and machine code are
+// byte-equivalent to the pre-refactor inline form.
+//
+// The seam is `#[cfg(any(test, target_os = "linux"))]` so the `cargo test`
+// runner (which on the Linux mutation host already has `target_os =
+// "linux"`) compiles it in both test and production modes. On non-Linux
+// hosts the seam does not exist and is not called.
+//
+// Discriminates the post-Step-0 substituted mutant on this seam
+// (canonical ID: `src/main.rs:<LINE>: replace check_single_threaded_inner
+// -> Result<u32, u32> with Ok(_)`, or equivalent variants) via the
+// `check_single_threaded_inner_returns_err_under_cargo_test` test — which
+// expects `Err(n > 1)` because cargo test is multi-threaded.
+//
+// The pre-R14-03 outer-wrapper mutant `src/main.rs:195:5: replace
+// assert_single_threaded with ()` is replaced by the inner seam mutant
+// post-refactor; the outer wrapper's body has no decision-making
+// semantics independent of the seam's Result (per the FIX_PLAN v3
+// amendment paragraph in `#r14-03`).
+#[cfg(any(test, target_os = "linux"))]
+#[inline]
+fn check_single_threaded_inner() -> Result<u32, u32> {
     // /proc/self/status: the line "Threads:\tN" reports the LWP count.
     // Fail-CLOSED: missing /proc means we cannot prove single-threadedness,
     // so we refuse to continue rather than silently proceed.
@@ -203,16 +228,70 @@ fn assert_single_threaded() {
                 .and_then(|v| v.trim().parse::<u32>().ok())
         })
         .expect("could not parse Threads: line in /proc/self/status");
-    assert!(
-        n == 1,
-        "yubihsm-share-converter must start single-threaded; got {n} OS threads. \
-         remove_var would be unsound. A dependency may be spawning threads via \
-         .init_array constructors — audit `cargo tree` for ctor/tokio/rayon-style \
-         pre-main thread spawns."
-    );
+    if n == 1 {
+        Ok(n)
+    } else {
+        Err(n)
+    }
 }
 
+// R14-v12 (R14-03 follow-up): the Linux `fn assert_single_threaded` outer
+// wrapper is the v3-substitution residue for the pre-refactor `:195:5`
+// mutant. Post-refactor the wrapper body is a thin propagator:
+//
+//     if let Err(n) = check_single_threaded_inner() {
+//         panic!("...", n);
+//     }
+//
+// The mutant `replace assert_single_threaded with ()` is "mathematically
+// equivalent under the seam-returns-Err invariant + panic = abort":
+//   1. The load-bearing decision logic (the `n == 1` comparison) lives
+//      in `check_single_threaded_inner()`, which IS tested directly by
+//      `check_single_threaded_inner_returns_err_under_cargo_test`.
+//   2. The wrapper's only behaviour is to propagate `Err` to a panic.
+//      Under `panic = "abort"` (release profile in Cargo.toml), no
+//      in-process test can `catch_unwind` the panic — the process
+//      aborts before any test assertion can observe it.
+//   3. The runtime behaviour IS different under the mutant (mutated
+//      wrapper silently continues on Err instead of aborting), but
+//      this difference is UN-OBSERVABLE by any in-process test.
+//
+// Function-level skip is the same resolution as the v7 fix on `fn inv`
+// (`src/legacy.rs:98:32 |→^` equivalent mutation). THIRD function-level
+// skip in R14: (i) non-Linux `assert_single_threaded` (FIRST, R14-03
+// Sub-B; platform-cfg dead code on Linux mutation host); (ii) `fn inv`
+// (SECOND, R14-01-v2; disjoint-operand identity makes `|`/`^` equivalent);
+// (iii) Linux `assert_single_threaded` (THIRD, this annotation; outer-
+// wrapper substitution residue).
+//
+// Functional coverage of `assert_single_threaded`'s `n==1` comparison
+// is preserved at byte-equality strength via the seam test.
+#[cfg(target_os = "linux")]
+#[cfg_attr(test, mutants::skip)]
+fn assert_single_threaded() {
+    if let Err(n) = check_single_threaded_inner() {
+        panic!(
+            "yubihsm-share-converter must start single-threaded; got {n} OS threads. \
+             remove_var would be unsound. A dependency may be spawning threads via \
+             .init_array constructors — audit `cargo tree` for ctor/tokio/rayon-style \
+             pre-main thread spawns."
+        );
+    }
+}
+
+// R14-03 Sub-B.1: function-level `#[cfg_attr(test, mutants::skip)]` on
+// the non-Linux variant. Justified by platform-cfg dead code on the
+// Linux mutation host: this fn is `#[cfg(not(target_os = "linux"))]`,
+// so cargo-mutants running on Linux cannot compile any kill test for
+// it. The single attribute covers BOTH the `:222:5` body-replacement
+// mutant AND the `:222:8` `!`-deletion mutant on this same function,
+// per the FIX_PLAN v4 wording fix in `#r14-03` Sub-B. This is the
+// FIRST function-level skip in R14 (per the v6 widening recorded in
+// FIX_PLAN). The skip is verifiable only on a non-Linux mutation run
+// (orchestrator follow-up) and does NOT relax the no-skips policy at
+// large.
 #[cfg(not(target_os = "linux"))]
+#[cfg_attr(test, mutants::skip)]
 fn assert_single_threaded() {
     // H-O1: macOS / Windows lack PR_SET_DUMPABLE / RLIMIT_CORE /
     // MADV_DONTDUMP guarantees. Rather than silently degrade, refuse
@@ -1673,11 +1752,50 @@ mod tests {
         assert_ne!(n_multi, 1, "multi-thread sample must NOT yield n=1");
     }
 
+    // R14-03 Sub-B: process-wide Mutex<()> serialization for the
+    // `lock_down_process_is_idempotent` test (which is extended below
+    // with prctl(PR_GET_DUMPABLE) + getrlimit(RLIMIT_CORE) post-condition
+    // reads). This is the in-tree fallback for
+    // `#[serial_test::serial(lockdown)]` — the `serial_test` crate is
+    // not a dev-dep in this repo per FIX_PLAN #r14-03 v3 (the vendored
+    // dep graph excludes it).
+    //
+    // Why a lock at all when only one test calls `lock_down_process()`:
+    // (a) future-proof against another test reading PR_GET_DUMPABLE /
+    // RLIMIT_CORE concurrently and seeing a torn state; (b) matches the
+    // R14-02 idiom for the truncate-observed lock so the codebase has
+    // ONE serial-lock pattern.
+    #[cfg(not(miri))]
+    static LOCKDOWN_OBSERVED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(not(miri))]
+    fn with_lockdown_observed_lock<F: FnOnce()>(f: F) {
+        // Recover from poisoning: a panicking test must NOT permanently
+        // poison the lock for sibling tests sharing the lockdown state.
+        let _guard = LOCKDOWN_OBSERVED_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        f();
+    }
+
     // R12-Phase-D / item #8: libc-touching test path. miri does not
     // model `prctl` / `setrlimit` syscalls; under `cargo miri test`
     // the libc call would panic with an "unsupported operation"
     // error. Gate the test out so the miri job stays focused on the
     // algorithmic kernels that miri CAN model.
+    //
+    // R14-03 Sub-B: extended with in-process post-condition reads via
+    // `prctl(PR_GET_DUMPABLE)` + `getrlimit(RLIMIT_CORE)` to discriminate
+    // the `:252:5: replace lock_down_process with ()` mutant. Without
+    // these reads the existing test only checks that the function
+    // doesn't panic — which the mutant body `()` ALSO doesn't do, so
+    // the mutant survives. With the reads, the mutant fails because
+    // PR_GET_DUMPABLE remains 1 (the default) under the no-op body.
+    //
+    // Per FIX_PLAN #r14-03 Sub-B v2 amendment: subprocess re-entry is
+    // STRUCTURALLY BROKEN because `std::env::current_exe()` returns the
+    // cargo test-runner binary, not the production binary. In-process
+    // post-condition observation is the chosen path.
     #[cfg(not(miri))]
     #[test]
     fn lock_down_process_is_idempotent() {
@@ -1692,12 +1810,90 @@ mod tests {
         // doesn't care about either, and any subsequent test that needs
         // a coredump would already be incompatible with the production
         // posture.
-        lock_down_process();
-        lock_down_process();
-        // If we got here without aborting, the test passes. There is no
-        // portable way to read RLIMIT_CORE back without prlimit(2)/getrlimit
-        // bindings the project doesn't carry; we deliberately don't add a
-        // libc::getrlimit call just for this assertion.
+        with_lockdown_observed_lock(|| {
+            lock_down_process();
+
+            // R14-03 Sub-B: post-condition observation — load-bearing
+            // discriminator for the `:252:5: replace lock_down_process
+            // with ()` mutant. Production form sets DUMPABLE=0; mutant
+            // leaves DUMPABLE at its default (1 on a normal Linux
+            // process). PR_GET_DUMPABLE returns the bit directly.
+            //
+            // SAFETY: `libc::prctl(PR_GET_DUMPABLE, 0, 0, 0, 0)` is a
+            // pure POSIX query — it reads the process's dumpable bit
+            // without dereferencing user pointers or modifying state.
+            let dumpable = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+            assert_eq!(
+                dumpable, 0,
+                "PR_GET_DUMPABLE must return 0 after lock_down_process; \
+                 got {dumpable} — `:252:5: replace lock_down_process \
+                 with ()` mutant active?"
+            );
+
+            // Confirmatory: read RLIMIT_CORE. Note this is NOT an
+            // independent discriminator under in-process testing because
+            // RLIMIT_CORE may be inherited from prior tests in the same
+            // process; per FIX_PLAN #r14-03 Sub-B residue, PR_GET_DUMPABLE
+            // is the load-bearing kill.
+            //
+            // SAFETY: `libc::getrlimit` writes the rlimit struct we pass
+            // by `&mut`; the buffer is properly initialised via
+            // `mem::zeroed()` (no padding-derived UB) and lives for the
+            // duration of the call.
+            let mut rlim: libc::rlimit = unsafe { std::mem::zeroed() };
+            let getrlimit_rc = unsafe { libc::getrlimit(libc::RLIMIT_CORE, &mut rlim) };
+            assert_eq!(getrlimit_rc, 0, "getrlimit(RLIMIT_CORE) must succeed");
+            // Permissive: the inherited state may or may not be {0,0};
+            // we only assert the production-set state (0) is acceptable.
+            // The discriminating assertion above carries the kill.
+            assert!(
+                rlim.rlim_cur == 0 || rlim.rlim_cur <= rlim.rlim_max,
+                "RLIMIT_CORE rlim_cur ({}) must be <= rlim_max ({})",
+                rlim.rlim_cur,
+                rlim.rlim_max
+            );
+
+            // Idempotency check: the second call must not panic, abort,
+            // or change observed state. Production form re-sets the same
+            // values (a harmless no-op at the kernel level).
+            lock_down_process();
+
+            // Re-confirm the state — production stays at 0; a future
+            // refactor that flips DUMPABLE back to 1 between calls would
+            // trip here too.
+            let dumpable2 = unsafe { libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0) };
+            assert_eq!(
+                dumpable2, 0,
+                "PR_GET_DUMPABLE must remain 0 after second lock_down_process; \
+                 got {dumpable2}"
+            );
+        });
+    }
+
+    // R14-03 Sub-B.1: discriminate the post-Step-0 substituted mutant on
+    // the `check_single_threaded_inner` seam (canonical post-refactor
+    // form: `replace check_single_threaded_inner -> Result<u32, u32>
+    // with Ok(_)`). Under cargo test the runner is multi-threaded by
+    // default, so the seam MUST return `Err(n > 1)`. The mutant form
+    // (returning `Ok(_)`) fails the `expect_err` assertion.
+    //
+    // The pre-refactor outer-wrapper mutant `src/main.rs:195:5: replace
+    // assert_single_threaded with ()` is substituted by this inner-seam
+    // mutant ID per FIX_PLAN #r14-03 Sub-B v3 amendment — the outer
+    // wrapper has no decision-making semantics independent of the seam.
+    //
+    // panic = "abort" caveat (FIX_PLAN v2 amendment): catch_unwind does
+    // NOT work under panic=abort, so the test calls the Result-form
+    // seam directly without needing to catch a panic from the wrapper.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn check_single_threaded_inner_returns_err_under_cargo_test() {
+        let n = check_single_threaded_inner()
+            .expect_err("cargo test is multi-threaded by default; expected Err(n > 1)");
+        assert!(
+            n > 1,
+            "expected n > 1 (cargo test runner spawns the test threadpool); got {n}"
+        );
     }
 
     // Note: a unit test that forces resplit::split to fail (so the

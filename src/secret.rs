@@ -17,6 +17,28 @@
 use std::alloc::{alloc, dealloc, Layout};
 use zeroize::Zeroize;
 
+/// R14-02 (kill `src/secret.rs:125:39: replace == with != in
+/// Secret::with_capacity`): the EINVAL check inside the MADV_DONTDUMP
+/// error-handling path was previously inlined as
+/// `err.raw_os_error() == Some(libc::EINVAL)` at the call site, which
+/// the mutant flipped to `!=` with no executing test feeding a NON-
+/// EINVAL errno through that codepath (the test kernel accepts
+/// MADV_DONTDUMP, so the error branch is unreachable in normal tests).
+///
+/// Extracting the comparison into a small, pure helper makes the
+/// equality testable in isolation: the `is_einval_accepts_einval_rejects_eperm`
+/// test below synthesises both `EINVAL` and `EPERM` `io::Error`s and
+/// asserts polarity, killing the mutant deterministically.
+///
+/// Release-mode behaviour is byte-identical to the pre-R14-02 inline
+/// form: under LTO+inlining (Cargo.toml `[profile.release]` has
+/// `lto = "thin"` + `codegen-units = 1`), `is_einval` inlines back to
+/// the same comparison at the original call site.
+#[inline]
+fn is_einval(err: &std::io::Error) -> bool {
+    err.raw_os_error() == Some(libc::EINVAL)
+}
+
 /// Page-aligned heap buffer that is `MADV_DONTDUMP`-marked at construction
 /// and zeroed on Drop.
 ///
@@ -58,6 +80,12 @@ struct AllocGuard {
     defused: bool,
 }
 
+// R14-03 Sub-A.2: a `#[cfg(test)]`-gated atomic counter records each
+// AllocGuard::drop invocation AFTER the conditional dealloc side-effect.
+// The `alloc_guard_dealloc_observed` test reads the counter pre/post-drop
+// to discriminate the `:85:9: replace <impl Drop for AllocGuard>::drop
+// with ()` mutant (which skips the increment). Release-mode behaviour is
+// byte-identical: the counter line is stripped from non-test builds.
 impl Drop for AllocGuard {
     fn drop(&mut self) {
         if !self.defused {
@@ -70,7 +98,36 @@ impl Drop for AllocGuard {
                 dealloc(self.ptr, self.layout);
             }
         }
+        #[cfg(test)]
+        observe_alloc_guard_dealloc();
     }
+}
+
+// R14-03 Sub-A.2 test-only instrumentation: counter for AllocGuard::drop.
+// Wrapped in a helper annotated `#[cfg_attr(test, mutants::skip)]` so
+// cargo-mutants does not mutate the instrumentation itself.
+#[cfg(test)]
+static ALLOC_GUARD_DEALLOC_OBSERVED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+#[cfg_attr(test, mutants::skip)]
+fn observe_alloc_guard_dealloc() {
+    ALLOC_GUARD_DEALLOC_OBSERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// R14-03 Sub-A.2: process-wide Mutex<()> serialization for the
+// `alloc_guard_dealloc_observed` test, mirroring the in-tree fallback
+// pattern established by R14-02 (`serial_test` is not a dev-dep here).
+#[cfg(test)]
+static ALLOC_GUARD_DEALLOC_OBSERVED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn with_alloc_guard_dealloc_observed_lock<F: FnOnce()>(f: F) {
+    let _guard = ALLOC_GUARD_DEALLOC_OBSERVED_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    f();
 }
 
 impl Secret {
@@ -122,7 +179,7 @@ impl Secret {
             let r = libc::madvise(ptr as *mut _, cap, libc::MADV_DONTDUMP);
             if r != 0 {
                 let err = std::io::Error::last_os_error();
-                if err.raw_os_error() == Some(libc::EINVAL) {
+                if is_einval(&err) {
                     static ONCE: std::sync::Once = std::sync::Once::new();
                     ONCE.call_once(|| {
                         eprintln!(
@@ -191,14 +248,87 @@ impl Secret {
     /// Truncate the logical length. The dropped bytes remain in the
     /// allocation and will be zeroed on Drop along with the rest of the
     /// page-rounded `cap`.
+    ///
+    /// R14-02 (kill `src/secret.rs:196:14: replace < with <= in
+    /// Secret::truncate`): the production form `n < self.len` and the
+    /// mutant form `n <= self.len` differ ONLY at the boundary
+    /// `n == self.len`. At the boundary, the production form takes the
+    /// no-op else branch (skip assignment); the mutant takes the then
+    /// branch and assigns `self.len = n` — a value-identical write that
+    /// produces NO visible state change. The behavioural delta is
+    /// observable only through instrumentation; a `#[cfg(test)]`
+    /// observation counter inside the then branch increments only when
+    /// the assignment runs, and the `truncate_at_boundary_does_not_assign`
+    /// test reads the counter delta to discriminate the boundary.
+    ///
+    /// Release-mode behaviour is byte-identical to the pre-R14-02 form:
+    /// the `#[cfg(test)]`-gated `observe_truncate_assign()` call is
+    /// stripped from non-test builds, leaving the same `if n < self.len
+    /// { self.len = n; }` body.
     #[allow(dead_code)]
     pub fn truncate(&mut self, n: usize) {
         if n < self.len {
             self.len = n;
+            #[cfg(test)]
+            observe_truncate_assign();
         }
     }
 }
 
+// R14-02 test-only instrumentation: a counter incremented inside the
+// then-branch of `Secret::truncate`. The counter is observed by
+// `truncate_at_boundary_does_not_assign` to discriminate the
+// `< -> <=` boundary mutant (mutant runs the then-branch at
+// `n == self.len`; production does not).
+//
+// The counter line is wrapped in `observe_truncate_assign()` and
+// annotated `#[cfg_attr(test, mutants::skip)]` so cargo-mutants does
+// NOT mutate the test-only instrumentation itself (e.g. replacing the
+// `fetch_add(1, Relaxed)` constant or ordering). The skip is
+// production-irrelevant because the function is fully `#[cfg(test)]`-
+// gated; cargo-mutants compiles in test mode and sees the attribute.
+#[cfg(test)]
+static TRUNCATE_ASSIGNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+#[cfg_attr(test, mutants::skip)]
+fn observe_truncate_assign() {
+    TRUNCATE_ASSIGNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// R14-02: the `serial_test` dev-dep is not present in the offline-
+// vendored dep graph for this repo (see `.cargo/config.toml`:
+// `replace-with = "vendored-sources"`). Per FIX_PLAN #r14-02 Step 3
+// "if `#[mutants::skip]` isn't supported at the statement level (it
+// may need to be on an enclosing function)" / Risks-and-residue note
+// on parallel-test serialization, the documented fallback is to
+// serialize the truncate-observing tests via an in-tree process-wide
+// `Mutex<()>` named lock with the same `truncate_observed` key
+// semantics. Three tests in this module call `Secret::truncate`
+// (the new boundary test + `secret_truncate_works` +
+// `secret_empty_tracks_logical_length`); all three lock this Mutex
+// for the duration of their body so the shared TRUNCATE_ASSIGNS
+// counter cannot observe a delta from a concurrently-running test.
+#[cfg(test)]
+static TRUNCATE_OBSERVED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn with_truncate_observed_lock<F: FnOnce()>(f: F) {
+    // Recover from poisoning: a panicking test must NOT permanently
+    // poison the lock for the other two tests in the serial-group.
+    let _guard = TRUNCATE_OBSERVED_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    f();
+}
+
+// R14-03 Sub-A.3: a `#[cfg(test)]`-gated atomic counter records each
+// Secret::drop invocation AFTER both the zeroize and dealloc side-effects.
+// The `secret_drop_observed` test reads the counter pre/post-drop to
+// discriminate the `:316:9: replace <impl Drop for Secret>::drop with ()`
+// mutant (which skips both side-effects and the counter increment).
+// Release-mode behaviour is byte-identical: the counter line is stripped
+// from non-test builds.
 impl Drop for Secret {
     fn drop(&mut self) {
         // Zero the entire allocation, not just `len`, since stale bytes
@@ -230,7 +360,39 @@ impl Drop for Secret {
             let layout = Layout::from_size_align_unchecked(self.cap, self.align);
             dealloc(self.ptr, layout);
         }
+        #[cfg(test)]
+        observe_secret_drop();
     }
+}
+
+// R14-03 Sub-A.3 test-only instrumentation: counter for Secret::drop.
+// Wrapped in a helper annotated `#[cfg_attr(test, mutants::skip)]` so
+// cargo-mutants does not mutate the instrumentation itself.
+#[cfg(test)]
+static SECRET_DROP_OBSERVED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+#[cfg_attr(test, mutants::skip)]
+fn observe_secret_drop() {
+    SECRET_DROP_OBSERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// R14-03 Sub-A.3: process-wide Mutex<()> serialization for the
+// `secret_drop_observed` test. Many tests in this module construct
+// `Secret` instances (`secret_basic_roundtrip`, `secret_truncate_works`,
+// the boundary tests, etc.) which would all increment the shared counter
+// if run in parallel. The lock guarantees the pre/post reads in the
+// observation test only see the local drop's increment.
+#[cfg(test)]
+static SECRET_DROP_OBSERVED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn with_secret_drop_observed_lock<F: FnOnce()>(f: F) {
+    let _guard = SECRET_DROP_OBSERVED_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    f();
 }
 
 fn page_size() -> usize {
@@ -283,27 +445,106 @@ mod tests {
         s.extend_from_slice(&[0u8; 9]);
     }
 
+    // R14-02: serialized via TRUNCATE_OBSERVED_LOCK because the
+    // truncate(4) + truncate(0) calls below increment the shared
+    // TRUNCATE_ASSIGNS counter; without the lock, a concurrent run of
+    // `truncate_at_boundary_does_not_assign` could observe a non-zero
+    // delta from these calls and false-positive-fail the boundary
+    // assertion.
     #[test]
     fn secret_truncate_works() {
-        let mut s = Secret::with_capacity(32);
-        s.extend_from_slice(&[0xABu8; 16]);
-        assert_eq!(s.len(), 16);
-        assert!(!s.is_empty());
-        s.truncate(99);
-        assert_eq!(s.len(), 16, "truncate past len must be a no-op");
-        s.truncate(4);
-        assert_eq!(s.len(), 4);
-        assert_eq!(s.as_slice(), &[0xABu8; 4]);
+        with_truncate_observed_lock(|| {
+            let mut s = Secret::with_capacity(32);
+            s.extend_from_slice(&[0xABu8; 16]);
+            assert_eq!(s.len(), 16);
+            assert!(!s.is_empty());
+            s.truncate(99);
+            assert_eq!(s.len(), 16, "truncate past len must be a no-op");
+            s.truncate(4);
+            assert_eq!(s.len(), 4);
+            assert_eq!(s.as_slice(), &[0xABu8; 4]);
+        });
     }
 
+    // R14-02: serialized via TRUNCATE_OBSERVED_LOCK (see note on
+    // `secret_truncate_works` above).
     #[test]
     fn secret_empty_tracks_logical_length() {
-        let mut s = Secret::with_capacity(4);
-        assert!(s.is_empty());
-        s.extend_from_slice(&[1, 2, 3]);
-        assert!(!s.is_empty());
-        s.truncate(0);
-        assert!(s.is_empty());
+        with_truncate_observed_lock(|| {
+            let mut s = Secret::with_capacity(4);
+            assert!(s.is_empty());
+            s.extend_from_slice(&[1, 2, 3]);
+            assert!(!s.is_empty());
+            s.truncate(0);
+            assert!(s.is_empty());
+        });
+    }
+
+    // R14-02: discriminate the `:125:39: replace == with != in
+    // Secret::with_capacity` boundary mutant. The helper `is_einval`
+    // is extracted from the inline `err.raw_os_error() ==
+    // Some(libc::EINVAL)` check in the MADV_DONTDUMP error-handling
+    // path. Test directly confirms the helper accepts EINVAL and
+    // rejects EPERM; the mutant (`!=` instead of `==`) flips both
+    // polarities and the test catches it on at least one side.
+    #[test]
+    fn is_einval_accepts_einval_rejects_eperm() {
+        let einval = std::io::Error::from_raw_os_error(libc::EINVAL);
+        let eperm = std::io::Error::from_raw_os_error(libc::EPERM);
+        assert!(is_einval(&einval), "EINVAL must be accepted");
+        assert!(!is_einval(&eperm), "EPERM must be rejected");
+    }
+
+    // R14-02: discriminate the `:196:14: replace < with <= in
+    // Secret::truncate` boundary mutant. Production form takes the
+    // then-branch ONLY when `n < self.len`; mutant form takes the
+    // then-branch ALSO when `n == self.len`. The cfg(test) counter
+    // records when the then-branch is taken; the test observes the
+    // counter does NOT increment on the boundary call (n == self.len)
+    // and DOES increment on the strict-less call.
+    //
+    // Serialized via TRUNCATE_OBSERVED_LOCK (in-tree fallback for the
+    // `serial_test::serial(truncate_observed)` attribute documented in
+    // FIX_PLAN #r14-02 — the dep is not present in the offline-
+    // vendored dep graph, so the documented Mutex fallback path is
+    // used). Three tests lock this mutex; `fetch_add(Relaxed)` is
+    // correct because each test body is single-threaded.
+    #[test]
+    fn truncate_at_boundary_does_not_assign() {
+        with_truncate_observed_lock(|| {
+            let pre = TRUNCATE_ASSIGNS.load(std::sync::atomic::Ordering::Relaxed);
+            let mut s = Secret::with_capacity(8);
+            // Populate to len == 4 via the public extend_from_slice API.
+            s.extend_from_slice(&[0u8, 1, 2, 3]);
+            assert_eq!(s.len(), 4);
+            // Boundary: truncate(4) where self.len == 4 — production
+            // takes the else branch (no assignment); mutant assigns
+            // self.len = 4 (value-identical, but the cfg(test) counter
+            // increments).
+            s.truncate(4);
+            let post = TRUNCATE_ASSIGNS.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                post - pre,
+                0,
+                "truncate(self.len) must NOT assign (production); \
+                 got {} assignment(s) — boundary mutant active?",
+                post - pre
+            );
+            assert_eq!(s.len(), 4, "truncate at boundary preserves length");
+            // Strictly-less: truncate(3) — assignment MUST happen
+            // exactly once. This proves the instrumentation isn't
+            // dead (cargo-mutants would otherwise survive a mutant
+            // that disables the counter entirely).
+            s.truncate(3);
+            let post2 = TRUNCATE_ASSIGNS.load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                post2 - post,
+                1,
+                "truncate(self.len - 1) MUST assign exactly once; got {}",
+                post2 - post
+            );
+            assert_eq!(s.len(), 3, "strict-less truncate updates length");
+        });
     }
 
     #[test]
@@ -340,6 +581,87 @@ mod tests {
         }
         impl<T: ?Sized> NotClone for T {}
         <Secret as NotClone>::_check();
+    }
+
+    // R14-03 Sub-A.2: discriminate the
+    // `src/secret.rs:85:9: replace <impl Drop for AllocGuard>::drop with ()`
+    // mutant. The production Drop body conditionally deallocs (when
+    // `defused == false`) and then increments the counter; the mutant
+    // replaces the entire body with `()` (no dealloc, no counter
+    // increment). The test allocates a page-aligned buffer, constructs
+    // an `AllocGuard` with `defused == false`, drops it (which must
+    // dealloc the buffer and increment the counter), and asserts the
+    // counter incremented — which would NOT happen under the mutant.
+    //
+    // Serialized via ALLOC_GUARD_DEALLOC_OBSERVED_LOCK so a parallel
+    // test that also constructs `AllocGuard` cannot race with the
+    // pre/post counter reads.
+    //
+    // Gated `#[cfg(not(miri))]` to match `madvise_panic_does_not_leak_alloc`:
+    // the test does a raw `alloc` + `dealloc` round-trip that miri's
+    // borrow-tracking model handles correctly, but keeping the gating
+    // parallel to the existing alloc-test reduces miri-job churn.
+    #[cfg(not(miri))]
+    #[test]
+    fn alloc_guard_dealloc_observed() {
+        use std::sync::atomic::Ordering;
+        with_alloc_guard_dealloc_observed_lock(|| {
+            let pre = ALLOC_GUARD_DEALLOC_OBSERVED.load(Ordering::Relaxed);
+            {
+                let page = page_size();
+                let layout = Layout::from_size_align(page, page).expect("layout");
+                // SAFETY: layout has size == page > 0 and align == page > 0,
+                // identical to the allocation pattern in `with_capacity`.
+                let ptr = unsafe { alloc(layout) };
+                if ptr.is_null() {
+                    std::alloc::handle_alloc_error(layout);
+                }
+                let guard = AllocGuard {
+                    ptr,
+                    layout,
+                    defused: false,
+                };
+                drop(guard);
+            }
+            let post = ALLOC_GUARD_DEALLOC_OBSERVED.load(Ordering::Relaxed);
+            assert!(
+                post > pre,
+                "AllocGuard::drop must run and observe the counter; \
+                 pre={pre} post={post} — `:85:9: replace <impl Drop for \
+                 AllocGuard>::drop with ()` mutant active?"
+            );
+        });
+    }
+
+    // R14-03 Sub-A.3: discriminate the
+    // `src/secret.rs:316:9: replace <impl Drop for Secret>::drop with ()`
+    // mutant. The production Drop body zeroize+dealloc's the allocation
+    // and then increments the counter; the mutant replaces the entire
+    // body with `()` (no zeroize, no dealloc, no counter increment).
+    // The test constructs a `Secret` via `with_capacity` + populates it
+    // via `extend_from_slice`, explicitly drops it, and asserts the
+    // counter incremented — which would NOT happen under the mutant.
+    //
+    // Serialized via SECRET_DROP_OBSERVED_LOCK so other tests that
+    // construct `Secret` cannot race the pre/post counter reads.
+    #[test]
+    fn secret_drop_observed() {
+        use std::sync::atomic::Ordering;
+        with_secret_drop_observed_lock(|| {
+            let pre = SECRET_DROP_OBSERVED.load(Ordering::Relaxed);
+            {
+                let mut s = Secret::with_capacity(32);
+                s.extend_from_slice(&[0xC3u8; 16]);
+                drop(s);
+            }
+            let post = SECRET_DROP_OBSERVED.load(Ordering::Relaxed);
+            assert!(
+                post > pre,
+                "Secret::drop must run and observe the counter; \
+                 pre={pre} post={post} — `:316:9: replace <impl Drop for \
+                 Secret>::drop with ()` mutant active?"
+            );
+        });
     }
 
     // R12-Phase-D / item #8: this test allocates a page-aligned buffer

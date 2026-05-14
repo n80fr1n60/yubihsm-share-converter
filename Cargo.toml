@@ -38,6 +38,18 @@ predicates = "3"
 # the matching `#[cfg(test)] #[global_allocator]` lives at the src/main.rs
 # crate root (M3 lock-in). Semver range, not exact pin (SD-9).
 dhat = "0.3"
+# R14-01-v2: the `mutants` proc-macro crate provides the `#[mutants::skip]`
+# attribute used (gated via `#[cfg_attr(test, mutants::skip)]`) on
+# `fn inv` in src/legacy.rs. The skip resolves the equivalent-mutation
+# survivor `src/legacy.rs:98:32: replace | with ^ in inv` (mathematical
+# proof recorded inline at the call site: bit-disjoint operands make
+# `|` and `^` byte-identical under the disjoint-mask invariant). The
+# crate is a no-op at compile time (the macro returns its input
+# unchanged); it carries no runtime weight. Listed under
+# [dev-dependencies] so release builds do not link it; the
+# `cfg_attr(test, ...)` wrapper means production code never references
+# the crate, only test-mode compilation (which cargo-mutants uses).
+mutants = "0.0.3"
 
 [profile.release]
 panic = "abort"
