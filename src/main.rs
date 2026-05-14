@@ -1296,6 +1296,31 @@ mod tests {
     }
 
     #[test]
+    fn max_input_bytes_is_sixteen_kib() {
+        assert_eq!(MAX_INPUT_BYTES, 16 * 1024);
+    }
+
+    #[test]
+    fn describe_blob_prefix_boundary_errors_are_distinct() {
+        let short = vec![0u8; PREFIX_LEN - 1];
+        let err = describe_blob(&short, false).expect_err("short prefix must fail");
+        assert!(
+            err.contains("shorter than the 20-byte prefix"),
+            "unexpected short-prefix error: {err}"
+        );
+
+        let exact_prefix = vec![0u8; PREFIX_LEN];
+        let err = describe_blob(&exact_prefix, false).expect_err("zero-byte key must fail");
+        assert!(
+            err.contains("not AES-128/192/256"),
+            "exact-prefix input must reach key-length validation, got: {err}"
+        );
+
+        let min_aes128_blob = vec![0u8; PREFIX_LEN + 16];
+        describe_blob(&min_aes128_blob, false).expect("20-byte prefix + AES-128 key is valid");
+    }
+
+    #[test]
     fn stdin_bound_rejects_one_over_cap() {
         // Feed exactly MAX_INPUT_BYTES + 1 bytes through the bounded reader
         // and assert it returns the cap-exceeded error. Pair this with the

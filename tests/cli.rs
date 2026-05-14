@@ -339,6 +339,25 @@ fn show_key_with_env_var_override_succeeds() {
 }
 
 #[test]
+fn show_key_with_ignoreboth_history_control_succeeds() {
+    // HISTCONTROL=ignoreboth is as safe as ignorespace for the override
+    // assignment: bash will omit leading-space commands from history. Keep
+    // HISTFILE set so the test specifically exercises the HISTCONTROL path,
+    // not the HISTFILE-disabled path.
+    let toy = load_fixture("toy_2of3.txt");
+    cmd()
+        .arg("--show-key")
+        .arg("--i-accept-disk-output")
+        .env("YHSC_ALLOW_DISK_STDOUT", "1")
+        .env("HISTFILE", "/tmp/yhsc-test-history")
+        .env("HISTCONTROL", "ignoreboth")
+        .write_stdin(toy)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("aes256_key (hex)"));
+}
+
+#[test]
 fn resplit_plus_show_key_is_rejected_by_clap() {
     // M-3-2 part (b): --resplit and --show-key are now clap-conflicting.
     // Pre-fix the pair was allowed (only --inspect-only carried
@@ -609,6 +628,19 @@ fn inspect_only_with_dual_override_is_a_noop() {
         stderr.contains("<redacted"),
         "inspect-only with the dual-knob flag must still redact the AES key; got stderr:\n{stderr}"
     );
+}
+
+#[test]
+fn inspect_only_ignores_blank_lines_and_comments() {
+    let toy = String::from_utf8(load_fixture("toy_2of3.txt")).expect("fixture utf-8");
+    let stdin = format!("\n# synthetic comment before shares\n{toy}\n# trailing comment\n\n");
+    cmd()
+        .arg("--inspect-only")
+        .write_stdin(stdin)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("[inspect-only]"))
+        .stderr(predicate::str::contains("recovery succeeded"));
 }
 
 // ─────────────────────── R4-5: over-determined cross-check ─────────────
@@ -922,20 +954,17 @@ fn over_determined_catches_corruption_at_byte_35() {
 /// R12-C-05 helper: the 5-of-8 ceremony has n=8, t=5 → 3 extra shares.
 /// Disjoint-subset cross-check kicks in at n ≥ 2t = 10 so 5-of-8 takes
 /// the over-determined branch — exactly the path we need to exercise.
-fn build_5_of_8_fixture_lines() -> Vec<String> {
+fn build_legacy_fixture_lines(threshold: u8, n: u8, payload_len: usize, seed: u64) -> Vec<String> {
     use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
     use rand::{rngs::StdRng, Rng, SeedableRng};
 
-    let payload_len = 36usize; // AES-128 wrap blob
     let secret: Vec<u8> = (0..payload_len as u8)
         .map(|i| i.wrapping_mul(11) ^ 0x3C)
         .collect();
     // Deterministic seed so the test is reproducible byte-for-byte.
-    let mut rng = StdRng::seed_from_u64(0xC0FF_EE58);
-    let threshold: u8 = 5;
-    let n: u8 = 8;
+    let mut rng = StdRng::seed_from_u64(seed);
 
-    // Generate 4 random coefficients per byte (degree = t-1 = 4).
+    // Generate threshold-1 random coefficients per byte (degree = t-1).
     let coeffs: Vec<Vec<u8>> = (0..payload_len)
         .map(|_| {
             (0..(threshold as usize - 1))
@@ -987,6 +1016,10 @@ fn build_5_of_8_fixture_lines() -> Vec<String> {
             format!("{threshold}-{x}-{b64}")
         })
         .collect()
+}
+
+fn build_5_of_8_fixture_lines() -> Vec<String> {
+    build_legacy_fixture_lines(5, 8, 36, 0xC0FF_EE58)
 }
 
 /// Helper: corrupt one byte of one of the share lines in place. Returns
@@ -1164,6 +1197,73 @@ fn over_determined_passes_clean_5_of_8() {
     // (post-resplit) wire format; that's covered separately by the
     // canonical fixture round-trip in cli.rs. Here we only assert the
     // over-determined check itself passes.
+}
+
+#[test]
+fn disjoint_subset_cross_check_passes_clean_3_of_6() {
+    // t=3, n=6 is the smallest case that exercises main()'s disjoint-subset
+    // branch with a nontrivial `shares[t..2*t]` range. This pins the slice
+    // endpoint and the success-side constant-time comparison.
+    let lines = build_legacy_fixture_lines(3, 6, 36, 0xC0FF_EE36);
+    let stdin = lines.join("\n") + "\n";
+    cmd()
+        .arg("--resplit")
+        .arg("--i-accept-disk-output")
+        .env("YHSC_ALLOW_DISK_STDOUT", "1")
+        .env_remove("HISTFILE")
+        .env("HISTCONTROL", "ignorespace")
+        .write_stdin(stdin)
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "[ok] disjoint-subset cross-check passed",
+        ));
+}
+
+#[test]
+fn resplit_accepts_nine_input_shares() {
+    // yubihsm-manager's line format caps emitted share indices at one digit.
+    // n=9 is the inclusive upper bound and must remain accepted.
+    let lines = build_legacy_fixture_lines(2, 9, 36, 0xC0FF_EE09);
+    let stdin = lines.join("\n") + "\n";
+    let assert = cmd()
+        .arg("--resplit")
+        .arg("--i-accept-disk-output")
+        .env("YHSC_ALLOW_DISK_STDOUT", "1")
+        .env_remove("HISTFILE")
+        .env("HISTCONTROL", "ignorespace")
+        .write_stdin(stdin)
+        .assert()
+        .success();
+
+    let out = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is utf-8");
+    let share_lines: Vec<&str> = out
+        .lines()
+        .filter(|l| l.len() >= 4 && l.as_bytes()[1] == b'-' && l.as_bytes()[3] == b'-')
+        .collect();
+    assert_eq!(
+        share_lines.len(),
+        9,
+        "expected 9 emitted shares; got: {out:?}"
+    );
+}
+
+#[test]
+fn resplit_refuses_ten_input_shares() {
+    // n=10 would require a two-digit share index in the manager-facing
+    // output, so main() must refuse before emitting any new-format shares.
+    let lines = build_legacy_fixture_lines(2, 10, 36, 0xC0FF_EE10);
+    let stdin = lines.join("\n") + "\n";
+    cmd()
+        .arg("--resplit")
+        .arg("--i-accept-disk-output")
+        .env("YHSC_ALLOW_DISK_STDOUT", "1")
+        .env_remove("HISTFILE")
+        .env("HISTCONTROL", "ignorespace")
+        .write_stdin(stdin)
+        .assert()
+        .code(9)
+        .stderr(predicate::str::contains("n=10 > 9"));
 }
 
 #[test]

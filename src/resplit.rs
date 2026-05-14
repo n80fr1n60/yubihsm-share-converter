@@ -354,4 +354,18 @@ mod tests {
         // products jointly determine the irreducible polynomial.
         assert_eq!(mul_aes(0x57, 0x13), 0xFE);
     }
+
+    #[test]
+    fn eval_poly_uses_xor_addition_between_terms() {
+        // p(x) = c1*x + secret in GF(2^8)/0x11B. This pins the XOR in
+        // Horner's step, not just the public mul_aes kernel. A bitwise AND
+        // there would silently drop coefficients when the accumulator starts
+        // at zero.
+        let secret = 0xA5;
+        let coeff = 0x5C;
+        let x = 2;
+        let want = mul_aes(coeff, x) ^ secret;
+        assert_eq!(eval_poly(secret, &[coeff], x), want);
+        assert_ne!(want, secret, "chosen coefficient must affect the output");
+    }
 }

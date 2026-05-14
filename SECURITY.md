@@ -23,7 +23,7 @@ using GitHub's **Private Vulnerability Reporting** channel:
 
 1. Navigate to the repository's **Security** tab on github.com (the
    per-repo Security tab — for this repo:
-   `https://github.com/<owner>/yubihsm-share-converter/security`).
+   `https://github.com/n80fr1n60/yubihsm-share-converter/security`).
 2. Click **Report a vulnerability**.
 3. Fill in the advisory form. Provide a short description, reproduction
    steps, and (if possible) a suggested mitigation. Attach a proof-of-

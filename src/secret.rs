@@ -270,6 +270,7 @@ mod tests {
         // A 0-byte extend on a 0-hint Secret must succeed (0 + 0 <= 1).
         s.extend_from_slice(&[]);
         assert_eq!(s.len(), 0);
+        assert!(s.is_empty());
         assert!(s.as_slice().is_empty());
     }
 
@@ -287,9 +288,32 @@ mod tests {
         let mut s = Secret::with_capacity(32);
         s.extend_from_slice(&[0xABu8; 16]);
         assert_eq!(s.len(), 16);
+        assert!(!s.is_empty());
+        s.truncate(99);
+        assert_eq!(s.len(), 16, "truncate past len must be a no-op");
         s.truncate(4);
         assert_eq!(s.len(), 4);
         assert_eq!(s.as_slice(), &[0xABu8; 4]);
+    }
+
+    #[test]
+    fn secret_empty_tracks_logical_length() {
+        let mut s = Secret::with_capacity(4);
+        assert!(s.is_empty());
+        s.extend_from_slice(&[1, 2, 3]);
+        assert!(!s.is_empty());
+        s.truncate(0);
+        assert!(s.is_empty());
+    }
+
+    #[test]
+    fn page_size_is_realistic_page_alignment() {
+        let page = page_size();
+        assert!(
+            page.is_power_of_two(),
+            "page size must be a power of two: {page}"
+        );
+        assert!(page >= 4096, "page size is unexpectedly small: {page}");
     }
 
     #[test]

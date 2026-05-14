@@ -10,7 +10,7 @@ name: Mutants
 #
 # Schedule: Monday 06:00 UTC, plus workflow_dispatch for manual runs.
 # The job opens a GitHub Issue if the kill-ratio dips below the 95%
-# absolute floor (LOCKED at R12-v2-residue). The Issue is the
+# absolute floor. The Issue is the
 # regression alert; the CI run itself remains non-blocking so a
 # transient flaky test cannot wedge the PR pipeline.
 
@@ -29,7 +29,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  KILL_RATIO_FLOOR: '0.95'    # R12-v2-residue lock: 95% absolute floor
+  # Locked floor. Current local baseline after targeted survivor tests
+  # (2026-05-13): 185 caught / (185 caught + 9 missed + 0 timeout) = 0.9536.
+  KILL_RATIO_FLOOR: '0.95'
 
 jobs:
   mutants:
@@ -66,8 +68,8 @@ jobs:
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
       - name: Run cargo-mutants
-        # --in-place: mutate the working tree (default; cargo-mutants
-        #             reverts each mutation after testing).
+        # Default copy mode: compatible with --jobs and keeps each
+        #             parallel mutation in an isolated scratch tree.
         # --no-shuffle: deterministic mutation order for reproducible
         #             regression reports.
         # --timeout 60: per-mutation test timeout in seconds.
@@ -88,12 +90,11 @@ jobs:
           # kill the job (we want to compute the ratio either way).
           set +e
           cargo mutants \
-            --in-place \
             --no-shuffle \
             --timeout 60 \
             --colors never \
             --jobs 2 \
-            --output "$out_dir" \
+            --output . \
             -- --release --locked
           rc=$?
           set -e
