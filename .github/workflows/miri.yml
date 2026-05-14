@@ -89,7 +89,26 @@ jobs:
         with:
           shared-key: miri
       - name: cargo miri setup
-        run: cargo +nightly miri setup
+        # The repo's `.cargo/config.toml` has `replace-with = "vendored-sources"`
+        # pointing at `vendor/`, which is the project's supply-chain anchor
+        # (SLSA-style locked deps). miri's sysroot rebuild, however, needs
+        # std-internal deps like `hashbrown`, `compiler_builtins`, `gimli`,
+        # `addr2line` etc. — these come from `rust-src` (Rust's OWN supply
+        # chain, pinned separately by toolchain version + sha256-verified
+        # rustup install above), NOT from `vendor/`. With vendor-replacement
+        # in effect, miri's setup fails: "no matching package named
+        # `hashbrown` found" / "fatal error: failed to build sysroot".
+        #
+        # Bypass vendor-replacement for this single step only by moving
+        # `.cargo/config.toml` aside, running setup, then restoring it.
+        # After setup, the sysroot is cached; subsequent `cargo miri test`
+        # runs against the cached sysroot, and the project's own crates
+        # still resolve through `vendor/` as intended.
+        run: |
+          set -e
+          mv .cargo/config.toml /tmp/.cargo-config.toml.bak
+          cargo +nightly miri setup
+          mv /tmp/.cargo-config.toml.bak .cargo/config.toml
       - name: cargo miri test (lib + bin)
         # Run the full unit-test suite under miri. --lib covers the
         # library modules (legacy, parse, resplit, secret); --bin
