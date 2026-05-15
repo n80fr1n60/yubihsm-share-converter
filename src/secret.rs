@@ -222,25 +222,35 @@ impl Secret {
         #[cfg(not(miri))]
         unsafe {
             // MADV_DONTDUMP excludes these pages from any kernel coredump.
-            // v4: pre-3.4 kernels return EINVAL — warn-once and continue,
-            // since H4's RLIMIT_CORE=0 + PR_SET_DUMPABLE=0 still hold.
-            // Other errno values still abort.
+            //
+            // R20-01: madvise(MADV_DONTDUMP) is advisory hardening
+            // (best-effort coredump exclusion). Per the kernel's
+            // documented semantics, it can return EINVAL (old kernels
+            // without MADV_DONTDUMP support), EAGAIN (transient memory
+            // pressure), ENOMEM (insufficient memory), and other
+            // errnos. None of these affect Secret zeroization
+            // correctness — the page-aligned mmap + Drop-time zeroize
+            // are independent of the coredump-exclusion advice; H4's
+            // RLIMIT_CORE=0 + PR_SET_DUMPABLE=0 are the load-bearing
+            // controls and remain in force regardless of madvise's
+            // outcome. Pre-R20 only EINVAL was treated as recoverable;
+            // the post-R19 fuzz lane (resplit harness under ASAN)
+            // hit EAGAIN under memory pressure and panicked at the
+            // old non-EINVAL branch. Post-R20: any madvise() error
+            // becomes a one-shot warning + continue. The R14-02 helper
+            // `is_einval` (with R16-02's `#[allow(dead_code)]`) is
+            // preserved per SD-R20-1 (a) KEEP for its direct-invocation
+            // test coverage.
             let r = libc::madvise(ptr as *mut _, cap, libc::MADV_DONTDUMP);
             if r != 0 {
                 let err = std::io::Error::last_os_error();
-                if is_einval(&err) {
-                    static ONCE: std::sync::Once = std::sync::Once::new();
-                    ONCE.call_once(|| {
-                        eprintln!(
-                            "warning: MADV_DONTDUMP unsupported on this kernel; \
-                             relying on RLIMIT_CORE=0 + PR_SET_DUMPABLE=0 only."
-                        );
-                    });
-                } else {
-                    // M-C2: `guard`'s Drop will dealloc the page-aligned
-                    // allocation as the panic unwinds out of with_capacity.
-                    panic!("madvise(MADV_DONTDUMP) failed unexpectedly: {err}");
-                }
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    eprintln!(
+                        "warning: MADV_DONTDUMP failed ({err}); \
+                         relying on RLIMIT_CORE=0 + PR_SET_DUMPABLE=0 only."
+                    );
+                });
             }
         }
         guard.defused = true;
