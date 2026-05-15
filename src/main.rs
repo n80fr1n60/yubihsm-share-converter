@@ -2170,9 +2170,26 @@ mod tests {
     // accidentally reverts to byte-wise early-return, drops the
     // Zeroizing wrap, or short-circuits the per-share check.
 
-    /// Extract the over-determined branch source: from the `else if n > t {`
-    /// guard down to the matching closing brace. Used by the four greps
-    /// below; computed once per test invocation.
+    /// Extract the over-determined branch source: from `else if n > t {`
+    /// down to the matching `} else {`. Returns a direct sub-slice of
+    /// the `include_str!`'d source (zero allocation; the slice inherits
+    /// the `'static` lifetime).
+    ///
+    /// R17-01: pre-R17 the helper allocated a `String` and called
+    /// `Box::leak` to coerce it into `&'static str`. The post-R16 CI
+    /// miri lane — the first run to reach end-of-test under miri's
+    /// default leak-check, once R15-04 and R16-01 cleared the earlier
+    /// aborts — fired 4 end-of-test leak diagnostics (~22 KB total),
+    /// one per R12-C-05 grep test below. Rejected fixes:
+    /// `MIRIFLAGS=-Zmiri-ignore-leaks` (too broad, masks future leaks);
+    /// `#[cfg_attr(miri, ignore)]` on the four greps (regresses
+    /// R12-C-05 miri coverage); v1 option (a) `.to_string()` returning
+    /// owned `String` (eliminates the leak but allocates per call and
+    /// changes the return signature). The R12-C-05 invariants
+    /// (`constant_time_eq::`, `Zeroizing<Vec<u8>>`, non-short-circuit
+    /// `all_ok &=`, no `"byte"` + numeric-index locator in user-facing
+    /// `eprintln!`) remain enforced by the four grep tests below; the
+    /// substrate they grep over is bit-identical pre/post-R17.
     fn over_determined_branch_source() -> &'static str {
         let src = include_str!("main.rs");
         let start = src
@@ -2184,16 +2201,10 @@ mod tests {
         let end_offset = after
             .find("} else {")
             .expect("over-determined branch must be followed by an `} else {` for n == t");
-        // Return a 'static slice via Box::leak(String) — but we can do
-        // better: include_str! already returns 'static, so a sub-slice
-        // of it is also 'static. Build it via raw pointer slicing — or,
-        // safer, return a Box::leak'd owned String. Keep this test-only:
-        // Box::leak is fine here.
-        Box::leak(
-            after[..end_offset + "} else {".len()]
-                .to_string()
-                .into_boxed_str(),
-        )
+        // R17-01: direct sub-slice of the `include_str!`'d source. The
+        // returned reference inherits the `'static` lifetime from
+        // `include_str!`'s return type, with zero heap allocation.
+        &after[..end_offset + "} else {".len()]
     }
 
     #[test]
