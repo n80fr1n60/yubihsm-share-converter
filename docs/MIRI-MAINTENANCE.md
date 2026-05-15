@@ -140,37 +140,62 @@ regression before landing the new pins.
 |---------|------|-------------|------------|-------|
 | Q2 2026 | R15-02 land commit | `nightly` (unpinned) | repository maintainer per CODEOWNERS | Initial miri matrix-shape pin: Stacked Borrows BLOCKING + Tree Borrows soak with `continue-on-error: true`; `-Zmiri-tree-borrows` MIRIFLAGS leg added under matrix axis. |
 
-## 3.1 `#[cfg(not(miri))]` gate ledger for production-code call sites
+## 3.1 production-code cfg-gate ledger (`#[cfg(not(miri))]` SKIP + `#[cfg(miri)]` STUB)
 
-Per the v4 amendment + R15-04 architectural rationale: every
-`#[cfg(not(miri))]` annotation added to a **production-code** call site
-(NOT a test-only call site; test-only sites follow the §2.1
-`#[cfg_attr(miri, ignore)]` ledger discipline) MUST carry an inline
-rationale comment ABOVE the gate naming:
+Per the v4 amendment + R15-04 architectural rationale (extended by
+R16-06 to cover two structurally-related gate kinds): every cfg-gate
+added to a **production-code** call site (NOT a test-only call site;
+test-only sites follow the §2.1 `#[cfg_attr(miri, ignore)]` ledger
+discipline) MUST carry an inline rationale comment ABOVE the gate AND
+a corresponding row in the ledger table below.
 
-1. miri's limitation on the syscall/operation being skipped (with the
-   exact "unsupported operation" error string from the miri output);
-2. the security property / defense-in-depth role of the gated call;
-3. the LOAD-BEARING fall-back controls that remain in place when the
-   gated call is skipped (typically process-level controls like H4's
-   `RLIMIT_CORE=0` + `PR_SET_DUMPABLE=0`; the syscall-skipped-under-miri
-   site MUST NEVER be the SOLE control for a security property);
-4. the miri-coverage goal preserved by the gate (the surrounding Rust
-   semantics that miri DOES validate).
+Two gate kinds are tracked. They are structural inverses of one another
+— both are R-round-tracked cfg-gates on production-code call sites,
+co-located in a single ledger for single-surface lookup:
 
-AND a corresponding row in the ledger table below. The ledger entry is a
-prerequisite for landing the gate — reviewers MUST reject any PR
-introducing a production-code `#[cfg(not(miri))]` without both the
+* **`cfg(not(miri)) skip`** — the production-code call site is EXCLUDED
+  from the miri build because miri's default isolation blocks the
+  underlying syscall/operation (e.g. R15-04's `libc::madvise(MADV_DONTDUMP)`).
+  The rationale comment names: (1) miri's limitation on the
+  syscall/operation being skipped (with the exact "unsupported
+  operation" error string from the miri output); (2) the security
+  property / defense-in-depth role of the gated call; (3) the
+  LOAD-BEARING fall-back controls that remain in place when the gated
+  call is skipped (typically process-level controls like H4's
+  `RLIMIT_CORE=0` + `PR_SET_DUMPABLE=0`; the syscall-skipped-under-miri
+  site MUST NEVER be the SOLE control for a security property); (4) the
+  miri-coverage goal preserved by the gate (the surrounding Rust
+  semantics that miri DOES validate).
+* **`cfg(miri) stub`** — a miri-specific stub provides a substitute
+  implementation so the surrounding test surface keeps exercising the
+  call site's contract under miri (e.g. R16-01's
+  `check_single_threaded_inner` Err(2) stub). The rationale comment
+  names: (1) the production form's miri-incompatibility (the
+  syscall/operation that blocks under miri's isolation); (2) the
+  test-side contract the stub preserves (the seam-test's Result-form
+  invariants — `.expect_err` + `n > 1` for R16-01); (3) the
+  intentionally-artificial nature of the stub (the production form
+  remains canonical on non-miri targets); (4) the cargo-mutants
+  invisibility (cargo-mutants compiles WITHOUT `--cfg miri`, so the
+  stub is mutated against the production form only).
+
+The ledger entry is a prerequisite for landing either gate kind —
+reviewers MUST reject any PR introducing a production-code
+`#[cfg(not(miri))]` SKIP or a `#[cfg(miri)]` STUB without both the
 inline rationale comment AND the ledger row. Mirrors the `[skip saw]`
 audit-trail discipline per `saw/MAINTENANCE.md §2` + the §2.1 ledger
 sub-section, but applied to PRODUCTION-CODE call sites instead of test
-annotations.
+annotations. Future R-rounds may extend the "Gate kind" column with
+additional kinds (e.g. a test-side `cfg_attr(miri, ignore)` paired with
+a production-side `cfg(not(miri))` bundle); the column is
+forward-extensible without further format changes.
 
 ### Ledger
 
-| Date | File:line | Gated syscall/operation | Security property | Load-bearing fall-back | R-round provenance | Maintainer |
-|------|-----------|--------------------------|-------------------|------------------------|---------------------|------------|
-| 2026-05-14 (R14→R15 boundary) | `src/secret.rs:211` (post-R15-04 placement; the R15-04 implementer landed +32 lines so subsequent line numbers shifted) | `libc::madvise(MADV_DONTDUMP)` | Kernel coredump exclusion of `Secret` bytes (defense-in-depth, per-VMA flag) | H4 process-level controls: `RLIMIT_CORE=0` (via `setrlimit` in `lock_down_process`) + `PR_SET_DUMPABLE=0` (via `prctl` in `lock_down_process`) | R15-04 v4 amendment | repository maintainer per CODEOWNERS |
+| Date | File:line | Gated function | Gate kind | Security property | Load-bearing fall-back | R-round provenance | Maintainer |
+|------|-----------|----------------|-----------|-------------------|------------------------|---------------------|------------|
+| 2026-05-14 (R14→R15 boundary) | `src/secret.rs:211` (post-R15-04 placement; the R15-04 implementer landed +32 lines so subsequent line numbers shifted) | `libc::madvise(MADV_DONTDUMP)` | `cfg(not(miri)) skip` | Kernel coredump exclusion of `Secret` bytes (defense-in-depth, per-VMA flag) | H4 process-level controls: `RLIMIT_CORE=0` (via `setrlimit` in `lock_down_process`) + `PR_SET_DUMPABLE=0` (via `prctl` in `lock_down_process`) | R15-04 v4 amendment | repository maintainer per CODEOWNERS |
+| 2026-05-15 (R16-01 land date) | `src/main.rs:228` (production form under `#[cfg(all(any(test, target_os = "linux"), not(miri)))]`) + `src/main.rs:271` (miri stub under `#[cfg(all(any(test, target_os = "linux"), miri))]`) | `check_single_threaded_inner` | `cfg(miri) stub` | Thread-count check under miri's isolation — the seam asserts the production binary's main-entry runtime has exactly 1 thread (the R14-03 v3-substitution residue discriminator protecting `Secret`-bearing code from multi-threaded execution); miri's isolation blocks the `/proc/self/status` open() syscall ("`open` not available when isolation is enabled" pre-R16-01), so the production parse cannot run under miri. The stub returns `Err(2)` — modeling a runtime with thread count > 1, which under the seam's contract returns Err. | `Err(2)` stub preserves the seam test's Result-form contract: the test `check_single_threaded_inner_returns_err_under_cargo_test` asserts `.expect_err(...)` + `n > 1` (both hold trivially for `Err(2)`). The production /proc parse runs unchanged under non-miri Linux targets and remains the canonical implementation. The load-bearing assertion `n == 1 -> Ok, else Err` is type-system-enforced in the production form; the miri path exercises the same Result-shape contract via a known Err value. cargo-mutants compiles in test mode WITHOUT `--cfg miri`, so the R14-03 Sub-B seam mutants are mutated against the production form only — this stub is invisible to mutation testing. | R16-01 | repository maintainer per CODEOWNERS |
 
 Future syscall additions land additional rows; the ledger discipline
 persists across rounds. The rotation cycle in §3 reviews every active
