@@ -2015,6 +2015,14 @@ mod tests {
     // any larger residue (≥ 2 net blocks) is treated as a regression in
     // recover()'s allocation discipline.
     use std::sync::Mutex;
+    // R16-04: the paired test `recover_makes_at_most_one_heap_alloc`
+    // (src/main.rs:~2046) is `#[cfg(not(miri))]`-gated (dhat installs a
+    // global allocator miri does not support), so DHAT_LOCK and the
+    // synthetic-share helper have no caller under `--cfg miri`. Adding
+    // `#[cfg(not(miri))]` here matches the paired-test gate and
+    // silences the dead-code warning without affecting any non-miri
+    // path.
+    #[cfg(not(miri))]
     static DHAT_LOCK: Mutex<()> = Mutex::new(());
 
     /// Build a deterministic synthetic 2-of-3 share set sized to a 36-byte
@@ -2024,6 +2032,7 @@ mod tests {
     /// happening between the two HeapStats snapshots. Shares are built
     /// BEFORE the profiler is consulted; all setup allocations are
     /// finalised before `before = HeapStats::get()` runs.
+    #[cfg(not(miri))]
     fn synthetic_shares_for_dhat_test() -> Vec<LegacyShare> {
         let secret: Vec<u8> = (0..36).map(|i| (i as u8).wrapping_mul(7) ^ 0xA5).collect();
         let coeffs: Vec<Vec<u8>> = (0..secret.len())

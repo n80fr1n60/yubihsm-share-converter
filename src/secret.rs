@@ -34,7 +34,16 @@ use zeroize::Zeroize;
 /// form: under LTO+inlining (Cargo.toml `[profile.release]` has
 /// `lto = "thin"` + `codegen-units = 1`), `is_einval` inlines back to
 /// the same comparison at the original call site.
+//
+// R16-02: post-R15-04 madvise gate (`#[cfg(not(miri))]` at line ~205)
+// leaves `is_einval` with no library-side caller under `--cfg miri`.
+// The R14-02 test `is_einval_accepts_einval_rejects_eperm`
+// (src/secret.rs:~522) still calls it under miri and continues to pass
+// (verified in the post-R15-04 CI run). The dead-code warning is a
+// library-compile artefact; `#[allow(dead_code)]` silences it without
+// affecting reachability or mutation surface.
 #[inline]
+#[allow(dead_code)]
 fn is_einval(err: &std::io::Error) -> bool {
     err.raw_os_error() == Some(libc::EINVAL)
 }
@@ -119,10 +128,18 @@ fn observe_alloc_guard_dealloc() {
 // R14-03 Sub-A.2: process-wide Mutex<()> serialization for the
 // `alloc_guard_dealloc_observed` test, mirroring the in-tree fallback
 // pattern established by R14-02 (`serial_test` is not a dev-dep here).
-#[cfg(test)]
+//
+// R16-03: the paired test `alloc_guard_dealloc_observed`
+// (src/secret.rs:~636) is `#[cfg(not(miri))]`-gated (it does a raw
+// `alloc` + `dealloc` round-trip kept parallel to
+// `madvise_panic_does_not_leak_alloc`), so this lock + helper have no
+// caller under `--cfg miri`. Combine the existing `#[cfg(test)]` with
+// `not(miri)` to silence the v3-residue dead-code warning without
+// weakening any check — the same gate the only caller already wears.
+#[cfg(all(test, not(miri)))]
 static ALLOC_GUARD_DEALLOC_OBSERVED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-#[cfg(test)]
+#[cfg(all(test, not(miri)))]
 fn with_alloc_guard_dealloc_observed_lock<F: FnOnce()>(f: F) {
     let _guard = ALLOC_GUARD_DEALLOC_OBSERVED_LOCK
         .lock()
