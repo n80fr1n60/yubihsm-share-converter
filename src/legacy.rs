@@ -447,6 +447,41 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn mul_legacy_associativity_exhaustive() {
+        // mul(mul(a, b), c) == mul(a, mul(b, c)) for every
+        // (a, b, c) ∈ u8 × u8 × u8 — the full 16.7M-triple
+        // input space. Discharges in ~1-3 s on a release-profile build
+        // (cargo test --release). The polynomial used is the legacy
+        // 0x11D reduction (mul body at src/legacy.rs:~120).
+        //
+        // Load-bearing for the Lagrange recovery at src/legacy.rs:133-175:
+        // Σ y_i · Π_{j /= i} x_j relies on the product Π being
+        // associative; a non-associative `mul` would yield parenthesisation-
+        // dependent values from the same input set.
+        //
+        // This test is the load-bearing every-push Rust-side defender of
+        // associativity post-R18-01 (which moved the Cryptol Z3 :prove
+        // mul_legacy_associative to offline-only). Mirrors the spec's
+        // `property mul_legacy_associative` at spec/properties.cry:306-308.
+        // See R18-03 in FIX_PLAN.html for the v2 rationale.
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                for c in 0u16..=255 {
+                    let a = a as u8;
+                    let b = b as u8;
+                    let c = c as u8;
+                    assert_eq!(
+                        mul(mul(a, b), c),
+                        mul(a, mul(b, c)),
+                        "mul is non-associative at a=0x{a:02x} b=0x{b:02x} c=0x{c:02x}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn mul_distributivity_over_xor_sampled() {
         // mul(a, b ⊕ c) == mul(a, b) ⊕ mul(a, c) over selected corner cases

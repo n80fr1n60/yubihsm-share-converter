@@ -112,7 +112,7 @@ run_cryptol() {
     -e CRYPTOLPATH=/work \
     "${CRYPTOL_IMAGE}" \
     -c ':set prover=z3' \
-    -c ':set prover-timeout = 1800' \
+    -c ':set prover-timeout = 300' \
     -c ':load spec/properties.cry' \
     -c ':prove mul_legacy_commutative' \
     -c ':prove mul_legacy_identity_one' \
@@ -131,8 +131,6 @@ run_cryptol() {
     -c ':prove inv_aes_round_trip' \
     -c ':prove inv_legacy_involution' \
     -c ':prove inv_aes_involution' \
-    -c ':prove mul_aes_associative' \
-    -c ':prove mul_legacy_associative' \
     -c ':prove mul_aes_fips197_self_square' \
     -c ':prove mul_aes_inv_pin_0x53_0xca' \
     -c ':prove mul_aes_reduction_anchor' \
@@ -152,16 +150,17 @@ run_cryptol() {
   fi
   local n_qed
   n_qed=$(grep -cE '^Q\.E\.D\.' /tmp/run-proofs.cryptol.log || true)
-  if [ "${n_qed}" -lt 26 ]; then
-    echo "FAIL: expected at least 26 CI-safe Cryptol Q.E.D. lines, got ${n_qed}" >&2
+  if [ "${n_qed}" -lt 24 ]; then
+    echo "FAIL: expected at least 24 CI-safe Cryptol Q.E.D. lines, got ${n_qed}" >&2
     exit 1
   fi
   echo "[ok] cryptol: ${n_qed} CI-safe Q.E.D. outcomes"
 }
 
 run_cryptol_offline() {
-  echo "=== Cryptol offline Lagrange proofs (image: ${CRYPTOL_IMAGE}) ==="
+  echo "=== Cryptol offline proofs (Lagrange + associativity; image: ${CRYPTOL_IMAGE}) ==="
   echo "NOTE: these obligations are intentionally excluded from CI; they can hit the 30-minute per-proof timeout."
+  echo "      Discharges 4 Lagrange t=2/t=3 outcomes + 2 GF(2^8) associativity proofs (mul_aes_associative + mul_legacy_associative)."
   docker run --rm \
     -v "${REPO_ROOT}:/work" -w /work \
     -e CRYPTOLPATH=/work \
@@ -173,6 +172,8 @@ run_cryptol_offline() {
     -c ':prove lagrange_recover_t2_generic' \
     -c ':prove overdet_consistent_t2' \
     -c ':check lagrange_recover_t3_vectors' \
+    -c ':prove mul_aes_associative' \
+    -c ':prove mul_legacy_associative' \
     | tee /tmp/run-proofs.cryptol-offline.log
   if grep -E '^Counterexample' /tmp/run-proofs.cryptol-offline.log >/dev/null 2>&1; then
     echo "FAIL: offline cryptol counterexample(s) found" >&2
@@ -185,11 +186,11 @@ run_cryptol_offline() {
   fi
   local n_outcomes
   n_outcomes=$(grep -cE '^(Q\.E\.D\.|passed [0-9]+ tests)' /tmp/run-proofs.cryptol-offline.log || true)
-  if [ "${n_outcomes}" -lt 4 ]; then
-    echo "FAIL: expected at least 4 offline Cryptol outcomes, got ${n_outcomes}" >&2
+  if [ "${n_outcomes}" -lt 6 ]; then
+    echo "FAIL: expected at least 6 offline Cryptol outcomes (4 Lagrange + 2 associativity), got ${n_outcomes}" >&2
     exit 1
   fi
-  echo "[ok] cryptol-offline: ${n_outcomes} Lagrange outcomes"
+  echo "[ok] cryptol-offline: ${n_outcomes} offline outcomes (Lagrange + associativity)"
 }
 
 run_saw() {

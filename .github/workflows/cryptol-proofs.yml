@@ -3,17 +3,33 @@ name: Cryptol proofs
 # R13-A / item 1: Machine-checked algebraic property proofs against the
 # Cryptol formal model under `spec/`. The workflow loads
 # `spec/properties.cry` and runs the CI-safe GF(2^8) algebraic and
-# inversion proof subset. Lagrange t=2/t=3 properties remain in the spec
-# for offline/manual verification; the pinned Cryptol/Z3 image timed out
-# on the first t=2 Lagrange proof at the 30-minute per-proof cap, so those
-# obligations are intentionally not part of the default CI gate.
+# inversion proof subset. The following obligations remain in the spec
+# (under `spec/properties.cry`) for offline / manual verification — the
+# pinned Cryptol/Z3 image timed out on each at the 30-minute per-proof
+# cap, so they are intentionally not part of the default CI gate:
+#   * Lagrange t=2/t=3 recovery properties (Lagrange-recover-related).
+#   * mul_aes_associative + mul_legacy_associative (R18-01: full
+#     associativity over [8]×[8]×[8] = 16.7M inputs requires
+#     minutes-to-hours of Z3 time at the current image pin; see
+#     spec/properties.cry:293-295 SOLVER NOTE).
+# Offline / manual verification path: invoke `cryptol` directly against
+# the pinned image with `:load spec/properties.cry` followed by a
+# `:prove <property>` for each offline-only property listed above (the
+# discharge takes minutes-to-hours); the same offline proofs are also
+# callable in a single command via `scripts/run-proofs.sh cryptol-offline`
+# (R13-Phase-F local-run wrapper; R18-04 extended its offline lane).
 #
 # Acceptance posture: workflow exits 0 only if EVERY default :prove returns
 # Q.E.D. Counterexamples, errors, or solver
-# time-outs fail the job hard. Per R13-v2 M2 the per-`:prove` safety
-# net `:set prover-timeout = 1800` caps any single property at 30 min
-# so an unexpected solver hang fails fast rather than starving the
-# 30-min container budget.
+# time-outs fail the job hard. Per R18-02 the per-`:prove` safety
+# net `:set prover-timeout = 300` caps any single property at 5 min
+# (well below the 30-min job cap) so an unexpected solver hang fails
+# fast inside Cryptol — the verify step's "Timed out" grep at line 163
+# catches the signal and the job terminates at ~5+ min wall time
+# instead of being cancelled at the 30-min runner-enforced boundary.
+# (Pre-R18-02 the per-proof cap was 1800 s == 30 min == the job cap,
+# making the safety net structurally inert — see R18-02 in FIX_PLAN.html
+# for the diagnosis and rationale.)
 #
 # R13-F refactor: the pinned Cryptol Docker image digest is sourced from
 # `.github/workflows/proof-digests.env` (single source of truth shared
@@ -111,7 +127,7 @@ jobs:
             -e CRYPTOLPATH=/work \
             "${{ steps.digests.outputs.image }}" \
             -c ':set prover=z3' \
-            -c ':set prover-timeout = 1800' \
+            -c ':set prover-timeout = 300' \
             -c ':load spec/properties.cry' \
             -c ':prove mul_legacy_commutative' \
             -c ':prove mul_legacy_identity_one' \
@@ -130,8 +146,6 @@ jobs:
             -c ':prove inv_aes_round_trip' \
             -c ':prove inv_legacy_involution' \
             -c ':prove inv_aes_involution' \
-            -c ':prove mul_aes_associative' \
-            -c ':prove mul_legacy_associative' \
             -c ':prove mul_aes_fips197_self_square' \
             -c ':prove mul_aes_inv_pin_0x53_0xca' \
             -c ':prove mul_aes_reduction_anchor' \
@@ -148,10 +162,13 @@ jobs:
           #   * "Counterexample" — a :prove found a witnessing input that
           #     falsifies the property. Hard failure.
           #   * "failed", "error", "Timed out" — solver-side failure.
-          #     Hard failure (the 1800s safety net inside Cryptol caps
-          #     each :prove at 30 min, so any "Timed out" line is a
+          #     Hard failure (the 300s per-proof safety net inside Cryptol
+          #     caps each :prove at 5 min; any "Timed out" line is a
           #     deliberate signal that the property is solver-intractable
-          #     at the current container budget).
+          #     at the current container budget — and now the job-side
+          #     30-min runner timeout strictly dominates the per-proof
+          #     timeout, so the safety net fails fast rather than racing
+          #     the runner enforcement).
           #
           # Success mode:
           #   * "Q.E.D." — :prove discharged with no counterexample.
@@ -168,15 +185,18 @@ jobs:
           # Count successful Q.E.D. lines. Each :prove prints one Q.E.D.
           successes=$(grep -cE '^Q\.E\.D\.' proof.log || true)
           echo "Successful :prove lines: $successes"
-          # We sent 26 :prove directives. Cryptol emits one Q.E.D. line
-          # per successful directive. The gate is ≥ 26; greater counts
+          # We sent 24 :prove directives. Cryptol emits one Q.E.D. line
+          # per successful directive. The gate is ≥ 24; greater counts
           # indicate the directive list expanded
-          # without the gate being updated.
-          if [ "$successes" -lt 26 ]; then
-            echo "FATAL: expected at least 26 success lines, got $successes." >&2
+          # without the gate being updated. (R18-01: list contracted
+          # from 26 to 24 — two associativity :proves moved to
+          # offline-only per the header comment block; see
+          # spec/properties.cry:293-295 SOLVER NOTE.)
+          if [ "$successes" -lt 24 ]; then
+            echo "FATAL: expected at least 24 success lines, got $successes." >&2
             exit 1
           fi
-          echo "OK: $successes success lines (≥ 26)."
+          echo "OK: $successes success lines (≥ 24)."
 
       - name: Post results to step summary
         if: ${{ always() }}
