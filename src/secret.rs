@@ -171,6 +171,38 @@ impl Secret {
         // recovered from in-band; non-EINVAL errors panic and the
         // `AllocGuard` (still armed at this point) frees `ptr` on the
         // unwind path.
+        //
+        // R15-04: gate `libc::madvise` behind `#[cfg(not(miri))]` because miri's
+        // interpreter does not model kernel-side advisory syscalls. The miri
+        // error is explicit: "error: unsupported operation: can't call foreign
+        // function `madvise` on OS `linux` ... this means the program tried to
+        // do something Miri does not support; it does not indicate a bug in the
+        // program."
+        //
+        // MADV_DONTDUMP at this site is R12-Phase-A best-effort defense-in-depth
+        // layered ABOVE the LOAD-BEARING controls:
+        //
+        //   - `RLIMIT_CORE=0` (set by `lock_down_process` via
+        //     `setrlimit(RLIMIT_CORE, {0, 0})` per H4)
+        //   - `PR_SET_DUMPABLE=0` (set by `lock_down_process` via
+        //     `prctl(PR_SET_DUMPABLE, 0)` per H4)
+        //
+        // If the kernel doesn't apply the MADV_DONTDUMP advisory (pre-3.4 kernel
+        // returning EINVAL, or under miri where the call is skipped entirely),
+        // the H4 process-level controls still hold and no `Secret` bytes can leak
+        // via coredump. Skipping under miri preserves full miri coverage of
+        // `Secret::with_capacity`'s page-aligned `std::alloc::alloc` + the
+        // `AllocGuard` Drop-on-unwind + the `is_einval` error-handling branch +
+        // the `Drop for Secret` zeroize-on-drop semantics — the load-bearing
+        // security surface this module exists to validate. Production behaviour
+        // on Linux >= 3.4 is byte-identical to pre-R15-04 (the gate evaluates
+        // true under non-miri builds).
+        //
+        // Project precedent: `src/main.rs::lock_down_process_is_idempotent`
+        // already gates `prctl` / `getrlimit` calls under `#[cfg(not(miri))]`
+        // for the same reason. See `docs/MIRI-MAINTENANCE.md` §3.1 ledger row 1
+        // (when R15-03 lands) for the tracking entry.
+        #[cfg(not(miri))]
         unsafe {
             // MADV_DONTDUMP excludes these pages from any kernel coredump.
             // v4: pre-3.4 kernels return EINVAL — warn-once and continue,

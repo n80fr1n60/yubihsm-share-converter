@@ -28,6 +28,19 @@ name: Miri
 #
 # The miri job runs on every push to main + every PR so a UB
 # regression surfaces during code review, not weeks later.
+#
+# R15-02: structural matrix-shape rewrite. The lane runs as a single
+# job with two matrix legs over `borrow_model: [stacked, tree]`:
+#
+#   * stacked (BLOCKING from day 1) — the pre-R15-02 baseline aliasing
+#     model; MIRIFLAGS: -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check.
+#   * tree (NEW; continue-on-error soak) — the parallel Tree Borrows
+#     leg; MIRIFLAGS: -Zmiri-tree-borrows -Zmiri-strict-provenance
+#     -Zmiri-symbolic-alignment-check. Per R13-v2 M8 soak-protocol
+#     mirror, ships with continue-on-error: true for 2 weeks / 5 PRs;
+#     after the soak end condition is met, a dedicated PR removes
+#     continue-on-error and the Tree Borrows leg flips to BLOCKING.
+#     See docs/MIRI-MAINTENANCE.md §1 for the soak-period record.
 
 on:
   push:
@@ -36,8 +49,13 @@ on:
     branches: [main, master]
   workflow_dispatch:
 
+# R15-02 / v2 fix L4 / Sec SF-5: `pull-requests: read` is required for
+# the `[skip miri]` label-guard step's curl call against the PR-files
+# endpoint (GitHub REST API). The contents:read scope is retained for
+# the actions/checkout step.
 permissions:
   contents: read
+  pull-requests: read
 
 concurrency:
   group: miri-${{ github.workflow }}-${{ github.ref }}
@@ -45,20 +63,82 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # miri-specific flags. -Zmiri-strict-provenance: tight provenance
-  # tracking (catches more UB at the cost of false-positives on
-  # legitimate `as usize` int-to-pointer casts). The codebase has been
-  # validated under strict-provenance; keeping it on locks the
-  # discipline in.
-  MIRIFLAGS: "-Zmiri-strict-provenance"
 
 jobs:
   miri:
-    name: cargo miri test
+    name: cargo miri test (${{ matrix.borrow_model }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # R15-02: matrix-form (planner default per SD-R15-1). Single job, two
+    # legs. fail-fast: false ensures both legs run to completion even if
+    # one fails — important so a Stacked Borrows regression doesn't mask
+    # a Tree Borrows discovery during soak (and vice versa).
+    strategy:
+      fail-fast: false
+      matrix:
+        borrow_model: [stacked, tree]
+    # R15-02 / R13-v2 M8 soak-pattern mirror: ONLY the Tree Borrows leg
+    # is non-blocking during the soak period. The Stacked Borrows leg is
+    # BLOCKING from day 1 (matches the pre-R15-02 baseline). After the
+    # 2-week / 5-PR soak end condition is met, a dedicated flip-to-
+    # BLOCKING PR removes this directive and the Tree Borrows leg
+    # becomes BLOCKING on push + PR. See docs/MIRI-MAINTENANCE.md §1.
+    continue-on-error: ${{ matrix.borrow_model == 'tree' }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      # R15-02 / v2 fix L4 / Sec SF-5: [skip miri] label-override guard.
+      # Mirrors the saw-proofs.yml [skip saw] idiom but with the stronger
+      # cross-finding correctness fix from R13-v3: if a protected file is
+      # in the PR diff, the [skip miri] label MUST NOT bypass the lane.
+      # The protected-paths list is the six files named in the locked-
+      # decisions block (R15-02 v2 fix High-1 / Sec SF-2 adds
+      # src/main.rs to cover the lock_down_process prctl/setrlimit/
+      # getrlimit unsafe blocks + the check_single_threaded_inner seam —
+      # both R14-03 system-call observation targets):
+      #
+      #   - src/main.rs    (lock_down_process unsafe; R14-03 observation seam)
+      #   - src/secret.rs  (AllocGuard + Secret<T> raw-pointer Drop)
+      #   - src/legacy.rs  (legacy::mul, legacy::inv)
+      #   - src/resplit.rs (resplit::mul_aes)
+      #   - src/recover.rs (Lagrange interp_at_zero)
+      #   - src/parse.rs   (input-parsing boundary)
+      #
+      # The label-guard runs only on the Tree Borrows leg (Stacked Borrows
+      # stays BLOCKING from day 1; [skip miri] cannot bypass it). The
+      # guard step is also conditioned on github.event_name ==
+      # 'pull_request' so push events skip the API call entirely.
+      - name: Check '[skip miri]' label against protected paths
+        if: matrix.borrow_model == 'tree' && github.event_name == 'pull_request'
+        env:
+          # Whitespace-separated list of protected paths. The order
+          # matches the locked-decisions block (R15-02 Acceptance #5).
+          PROTECTED: 'src/main.rs src/secret.rs src/legacy.rs src/resplit.rs src/recover.rs src/parse.rs'
+          # R15-02 / v2 fix L4 / Sec SF-5: explicit Authorization bearer
+          # header against the workflow GITHUB_TOKEN; an unauthenticated
+          # curl call would hit the anonymous 60-req/hr rate-limit
+          # shared across the runner IP's request pool.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          LABELS='${{ toJson(github.event.pull_request.labels.*.name) }}'
+          if echo "$LABELS" | grep -qF '"[skip miri]"'; then
+            echo "'[skip miri]' label detected; verifying no protected file is touched..."
+            CHANGED="$(curl -sf \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: bearer $GITHUB_TOKEN" \
+              '${{ github.event.pull_request.url }}/files' \
+              | python3 -c "import sys, json; [print(f['filename']) for f in json.load(sys.stdin)]")"
+            for path in $PROTECTED; do
+              if echo "$CHANGED" | grep -qF "$path"; then
+                echo "ERROR: '[skip miri]' label cannot bypass miri on a PR touching $path"
+                exit 1
+              fi
+            done
+            echo "'[skip miri]' label honoured; protected paths untouched."
+            echo "SKIP_MIRI=1" >> "$GITHUB_ENV"
+          fi
+
       - name: Install rustup (per-run sha256 verification)
         env:
           TOOLCHAIN: nightly
@@ -88,7 +168,7 @@ jobs:
       - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: miri
-      - name: cargo miri setup
+      - name: miri setup with trap-based vendor-bypass restore
         # The repo's `.cargo/config.toml` has `replace-with = "vendored-sources"`
         # pointing at `vendor/`, which is the project's supply-chain anchor
         # (SLSA-style locked deps). miri's sysroot rebuild, however, needs
@@ -104,12 +184,73 @@ jobs:
         # After setup, the sysroot is cached; subsequent `cargo miri test`
         # runs against the cached sysroot, and the project's own crates
         # still resolve through `vendor/` as intended.
+        #
+        # R15-02 / v2 fix Medium-2 / Sec SF-7 (+ SF-7-2): the legacy
+        # `mv .cargo/config.toml /tmp/.cargo-config.toml.bak && cargo
+        # +nightly miri setup && mv ...` pattern is REPLACED by a trap-
+        # based unconditional restore. If `miri setup` fails (sysroot-
+        # build error during quarterly toolchain rotation), the trap
+        # fires at EXIT and `.cargo/config.toml` is restored —
+        # subsequent steps in the same job remain anchored to the
+        # vendored crate cache (preserving the SLSA vendor anchor). The
+        # mktemp call randomises the backup path so a co-tenant on a
+        # self-hosted runner cannot pre-empt the predictable filename.
+        # See docs/MIRI-MAINTENANCE.md §6 for the vendor-bypass
+        # discipline.
         run: |
           set -e
-          mv .cargo/config.toml /tmp/.cargo-config.toml.bak
+          BAK="$(mktemp /tmp/.cargo-config.toml.bak.XXXXXX)"
+          cleanup() {
+            if [ -f "$BAK" ]; then
+              mv "$BAK" .cargo/config.toml
+            fi
+          }
+          trap cleanup EXIT
+          mv .cargo/config.toml "$BAK"
           cargo +nightly miri setup
-          mv /tmp/.cargo-config.toml.bak .cargo/config.toml
+          # trap fires at EXIT regardless of exit code
       - name: cargo miri test (lib + bin)
+        # R15-02: MIRIFLAGS are selected per matrix leg. The Stacked
+        # Borrows leg keeps the pre-R15-02 + R15-01 baseline
+        # (-Zmiri-strict-provenance + -Zmiri-symbolic-alignment-check);
+        # the Tree Borrows leg adds -Zmiri-tree-borrows.
+        #
+        # -Zmiri-strict-provenance: tight provenance tracking (catches
+        # more UB at the cost of false-positives on legitimate
+        # `as usize` int-to-pointer casts). The codebase has been
+        # validated under strict-provenance; keeping it on locks the
+        # discipline in.
+        #
+        # -Zmiri-symbolic-alignment-check (R15-01): tracks alignment-
+        # symbolic provenance through the program and catches alignment-
+        # violating UB at the construction site rather than the use
+        # site. The default miri alignment check is a best-effort
+        # NUMERIC check (computes the runtime address modulo the type's
+        # alignment) and can silently miss UB when the runtime address
+        # happens to align. The symbolic check is load-bearing for the
+        # codebase's `AllocGuard` page-aligned `std::alloc::alloc` paths
+        # (`Layout::from_size_align(cap, page)` in `src/secret.rs`) and
+        # the `Secret<T>` newtype's manually-aligned raw-pointer Drop
+        # discipline — both wrap raw pointers whose alignment
+        # invariants are construction-time properties, not use-site
+        # properties.
+        #
+        # -Zmiri-tree-borrows (R15-02, Tree Borrows leg only): selects
+        # Tree Borrows as the aliasing model instead of the default
+        # Stacked Borrows. Tree Borrows catches retag-violations on
+        # shared/mutable pointer interleavings that Stacked Borrows
+        # accepts (notably: the Drop-counter increments + the
+        # AtomicUsize-based ZEROIZE_OBSERVED counters R14-03 instruments
+        # on the Drop-impl trio). Soak posture: continue-on-error true
+        # at the job level for this leg; flips to BLOCKING via dedicated
+        # PR after 2 weeks / 5 PRs without regression.
+        #
+        # The `if: env.SKIP_MIRI != '1'` predicate short-circuits this
+        # step on PRs that pass the [skip miri] label-guard (which only
+        # fires on the Tree Borrows leg + only on pull_request events).
+        if: env.SKIP_MIRI != '1'
+        env:
+          MIRIFLAGS: ${{ matrix.borrow_model == 'tree' && '-Zmiri-tree-borrows -Zmiri-strict-provenance -Zmiri-symbolic-alignment-check' || '-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check' }}
         # Run the full unit-test suite under miri. --lib covers the
         # library modules (legacy, parse, resplit, secret); --bin
         # yubihsm-share-converter covers the main.rs test module. The
