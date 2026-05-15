@@ -26,6 +26,26 @@ name: Miri
 #     `inv_branchless_matches_reference_exhaustive` — too slow
 #     under miri's interpreter (SD-R12-4: 5-minute wall budget).
 #
+# R16-05 — R16-01 stub mechanism: production-code function with a
+# miri-specific implementation (NOT a test gate; a production-code
+# stub). This is the structural INVERSE of the `#[cfg(not(miri))]`
+# SKIP / `#[cfg_attr(miri, ignore)]` test-SKIP patterns enumerated
+# above — the test RUNS under miri and exercises the Result-shape
+# contract against a miri-side stub:
+#
+#   * `check_single_threaded_inner` (src/main.rs:~230 + ~273) has
+#     TWO cfg-gated definitions: `#[cfg(not(miri))]` runs the
+#     production `/proc/self/status` parse on Linux non-miri targets;
+#     `#[cfg(miri)]` returns `Err(2)` as a known-Err stub. The seam
+#     test `check_single_threaded_inner_returns_err_under_cargo_test`
+#     calls `.expect_err(...)` and asserts `n > 1`; both hold for
+#     `Err(2)` under miri. miri's default isolation blocks the
+#     underlying `open()` syscall for `/proc/self/status`, so the
+#     stub provides a structurally-equivalent miri-side path while
+#     preserving the production parse on non-miri Linux targets.
+#     See docs/MIRI-MAINTENANCE.md §3.1 ledger row 2 (R16-01) for
+#     the maintainer protocol.
+#
 # The miri job runs on every push to main + every PR so a UB
 # regression surfaces during code review, not weeks later.
 #
