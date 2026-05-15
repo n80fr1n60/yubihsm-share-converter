@@ -18,6 +18,34 @@ name: Fuzz
 # workflow copies them to `fuzz/corpus/<target>/` (the standard
 # cargo-fuzz corpus path) before invoking the fuzzer. A missing
 # corpus_seed directory FAILS the run (cp -r returns non-zero).
+#
+# R19-01: nightly toolchain pin (`nightly-2026-05-03`). Rationale:
+# upstream rustc nightlies built on or after 2026-05-03 (i.e. the
+# `nightly-2026-05-04` release channel and later) tightened the
+# "reserved namespace" gate, rejecting external crates that use
+# `rustc_*` attribute names (even when gated behind
+# `#[cfg_attr(rustc_attrs, ...)]`). cargo-fuzz's published Cargo.lock
+# pins `rustix 0.36.5`, which uses these reserved attributes; therefore
+# `cargo install cargo-fuzz --locked` fails to compile rustix under any
+# unpinned `nightly` reference. The pin to `nightly-2026-05-03` is the
+# freshest empirically-verified pre-lockdown day (probe ledger:
+# 2026-04-17 OK / 2026-05-01 OK / 2026-05-03 OK (rustc 20de910db) /
+# 2026-05-04 FAIL (rustc ad3a598ca; lockdown landing day) /
+# 2026-05-05 FAIL / 2026-05-08 FAIL / 2026-05-14 FAIL).
+#
+# Rotation playbook: bump the pin when (a) cargo-fuzz publishes a new
+# lockfile pinning a modern rustix (rustix 0.37+ has migrated off the
+# reserved attribute names; check the cargo-fuzz crate's Cargo.lock at
+# release-time), OR (b) the project needs a newer nightly feature (a
+# new MIRIFLAG, a new -Z compiler flag, a new fuzz sanitizer), OR (c)
+# a relevant rustc security advisory lands in a newer nightly we'd
+# want. To bump: (i) pick a candidate date YYYY-MM-DD; (ii) run the
+# empirical probe locally — `rustup install nightly-YYYY-MM-DD
+# --profile minimal && cargo +nightly-YYYY-MM-DD install cargo-fuzz
+# --locked --root /tmp/probe`; (iii) verify exit 0 + no rustix compile
+# error in the probe log; (iv) update both the `TOOLCHAIN:` value and
+# the `cargo +nightly-YYYY-MM-DD fuzz run` invocation; (v) update this
+# rationale block's probe ledger with the new working day.
 
 on:
   schedule:
@@ -98,7 +126,7 @@ jobs:
       - name: Install rustup (per-run sha256 verification)
         if: steps.route.outputs.skip != 'true'
         env:
-          TOOLCHAIN: nightly
+          TOOLCHAIN: nightly-2026-05-03
         run: |
           set -e
           # Sidecar pattern (mirrors ci.yml): download rustup-init AND
@@ -147,8 +175,10 @@ jobs:
           TARGET: ${{ matrix.target }}
         # 50min = 3000s libFuzzer time cap. -timeout=300 = 5min per-run
         # cap as a defence against infinite loops in a single input;
-        # libFuzzer reports each timeout but keeps going.
-        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=3000 -timeout=300
+        # libFuzzer reports each timeout but keeps going. R19-01: the
+        # `+nightly-2026-05-03` selector pins to the freshest known-
+        # working pre-lockdown nightly per the header comment block.
+        run: cargo +nightly-2026-05-03 fuzz run "$TARGET" -- -max_total_time=3000 -timeout=300
         continue-on-error: true
       - name: Upload crashes (if any)
         if: steps.route.outputs.skip != 'true' && always()
