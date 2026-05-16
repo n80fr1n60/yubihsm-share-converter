@@ -173,12 +173,36 @@ jobs:
         if: steps.route.outputs.skip != 'true'
         env:
           TARGET: ${{ matrix.target }}
+          # R21-02: ASAN_OPTIONS gates the ASAN internal-allocator
+          # policy. allocator_may_return_null=1 is DEFENCE-IN-DEPTH
+          # (NOT a recovery mechanism): it tells ASAN's allocator to
+          # return NULL on internal-pool OOM instead of aborting INSIDE
+          # the ASAN runtime. NOTE: Cargo.toml:55 sets panic = "abort"
+          # for release (which cargo-fuzz uses), and Rust's
+          # std::alloc::handle_alloc_error calls process::abort() by
+          # default, so any actual alloc-error path still SIGABRTs the
+          # libFuzzer process — collapsing the panic-vs-abort distinction.
+          # This flag prevents the most-common ASAN-internal-OOM-then-
+          # abort path but does NOT enable iteration-level recovery. The
+          # PRIMARY load-bearing fix is R21-01's harness clamp; this flag
+          # is structural insurance for the residual outlier.
+          ASAN_OPTIONS: allocator_may_return_null=1
         # 50min = 3000s libFuzzer time cap. -timeout=300 = 5min per-run
         # cap as a defence against infinite loops in a single input;
         # libFuzzer reports each timeout but keeps going. R19-01: the
         # `+nightly-2026-05-03` selector pins to the freshest known-
         # working pre-lockdown nightly per the header comment block.
-        run: cargo +nightly-2026-05-03 fuzz run "$TARGET" -- -max_total_time=3000 -timeout=300
+        # R21-02: -rss_limit_mb=4096 RELAXES libFuzzer's documented
+        # default of -rss_limit_mb=2048 (2 GB) up to 4 GB so libFuzzer's
+        # RSS check tolerates ASAN's 5-10x shadow-memory amplification
+        # without falsely terminating on shadow-memory growth alone,
+        # while still being structurally bounded below the GitHub
+        # runner's 7 GB physical RAM. -detect_leaks=1 instructs
+        # libFuzzer to run LSan at exit + emit hard leak reports —
+        # without this flag, a future Secret leak regression could
+        # masquerade as a benign RSS-limit hit. Both flags work together
+        # with R21-01's clamp + the continue-on-error step-level posture.
+        run: cargo +nightly-2026-05-03 fuzz run "$TARGET" -- -max_total_time=3000 -timeout=300 -rss_limit_mb=4096 -detect_leaks=1
         continue-on-error: true
       - name: Upload crashes (if any)
         if: steps.route.outputs.skip != 'true' && always()
