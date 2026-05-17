@@ -66,6 +66,19 @@ name = "cachegrind_kernels"
 path = "benches/cachegrind_kernels.rs"
 harness = false
 
+# R24-01 v3 LOCAL-ONLY: hand-rolled minimal dudect harness (NO
+# dudect-bencher dev-dep; that crate's transitive deps include clap 2.34 →
+# unsound atty per RUSTSEC-2021-0145, see #r22-01 SUPERSEDED record).
+# Welch's t-test + paper-§3.2 percentile cropping; depends only on
+# stdlib + the existing `rand 0.8` dev-dep at line 28. Invoked via
+# `scripts/run-ct-local.sh dudect` (LOAD-BEARING local discharge surface
+# per v3 LOCAL-ONLY scope; no CI workflow exists). See FIX_PLAN.html
+# #r24-plan + #r24-01 + #r24-v3-changelog for full rationale.
+[[bench]]
+name = "dudect_kernels"
+path = "benches/dudect_kernels.rs"
+harness = false
+
 [profile.release]
 panic = "abort"
 strip = "symbols"
