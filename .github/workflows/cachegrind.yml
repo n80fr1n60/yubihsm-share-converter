@@ -1,0 +1,254 @@
+name: Cachegrind
+
+# R23-01: deterministic cachegrind cache-simulator CT verification of
+# the 3 GF(2^8) production kernels (resplit::mul_aes, legacy::mul,
+# legacy::inv) + a synthetic AES-field-inversion chain composed from
+# resplit::mul_aes (R23-01-d, since no production Rust inv_aes exists
+# per R22 SD-R22-7 / R23 SD-R23-7).
+#
+# valgrind --tool=cachegrind replays every load/store + instruction
+# fetch through a simulated cache model + reports per-function counters.
+# With --branch-sim=yes (LOW-1 v2) the conditional + indirect branch
+# counters (Bc/Bcm/Bi/Bim) are also captured. If the cachegrind output
+# is byte-identical across runs with DIFFERENT secret inputs, the
+# kernel's instruction stream + data-access pattern + branch behaviour
+# is data-independent — no cache/branch timing channel. If the output
+# differs, there's a data-dependent control-flow or memory-access
+# pattern (REAL CT violation; cachegrind is deterministic so the diff
+# is not a flaky-test artefact).
+#
+# Complements R22 dudect at .github/workflows/dudect.yml: dudect
+# measures wall-clock variance (statistical); cachegrind measures
+# simulated cache + branch behaviour (deterministic). Both must pass.
+#
+# Schedule: push/PR (BLOCKING per SD-R23-5), Sunday 06:00 UTC cron
+# (1h before R22 dudect's 07:00 UTC slot), workflow_dispatch.
+#
+# See FIX_PLAN.html #r23-plan + #r23-01 + #r23-v2-changelog for full
+# rationale + SD-R23-1..7 for surfaced sub-decisions.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 6 * * 0'   # Sunday 06:00 UTC (1h before R22 dudect's 07:00 UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cachegrind-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  cachegrind:
+    name: cachegrind (${{ matrix.kernel }} × ${{ matrix.input_class }})
+    runs-on: ubuntu-22.04   # SD-R23-6 (b) pin
+    timeout-minutes: 30
+    strategy:
+      # Arch LOW-2 (v2): fail-fast: false is forensic — when a CT
+      # regression hits, we want every (kernel × input_class) entry to
+      # surface its counter diff in a single run, not abort on the
+      # first failure. Lets a reviewer see WHICH kernels and WHICH
+      # input classes diverged without re-running.
+      fail-fast: false
+      matrix:
+        kernel: [mul_aes, mul_legacy, inv_legacy, inv_aes_chain]
+        # Amendment 1 (v2): mul kernels exercise {zero, all-ones,
+        # canonical, sample}; inv kernels exercise {one, all-ones,
+        # canonical, sample}. The `exclude` block drops the cells the
+        # harness rejects: legacy::inv(0) returns Err via early-return
+        # (a separate cachegrind signature, NOT the CT property of the
+        # loop kernel body), so the inv kernels swap Zero → One.
+        # INFO-1 (v2): `random` renamed to `sample` to match the
+        # InputClass enum — the values are deterministic byte literals,
+        # not RNG-derived.
+        input_class: [zero, one, all-ones, canonical, sample]
+        exclude:
+          - { kernel: mul_aes,       input_class: one  }
+          - { kernel: mul_legacy,    input_class: one  }
+          - { kernel: inv_legacy,    input_class: zero }
+          - { kernel: inv_aes_chain, input_class: zero }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install rustup (per-run sha256 verification)
+        env:
+          TOOLCHAIN: stable
+        run: |
+          set -e
+          # Sidecar pattern (mirrors ci.yml + mutants.yml + dudect.yml):
+          # download rustup-init AND its sha256 sidecar from the canonical
+          # origin, verify before exec. No manual SHA rotation needed.
+          if command -v rustup >/dev/null 2>&1; then
+            rustup self uninstall -y || true
+          fi
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          curl --proto '=https' --tlsv1.2 -fsSLo rustup-init.sha256 \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
+          expected="$(cut -d ' ' -f1 rustup-init.sha256)"
+          actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
+          test "$actual" = "$expected"
+          chmod +x rustup-init
+          ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
+          rm -f rustup-init rustup-init.sha256
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: cachegrind
+      - name: Install valgrind (apt-pin per SD-R23-3)
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends valgrind=1:3.18.1-1ubuntu2
+          valgrind --version
+      - name: Build cachegrind harness
+        run: cargo build --release --bench cachegrind_kernels --no-run --locked
+      - name: Locate harness binary
+        id: locate-binary
+        run: |
+          set -e
+          # Cargo emits bench binaries to target/release/deps/<name>-<hash>.
+          # The hash changes per-build; we discover the binary by name pattern.
+          BINARY=$(find target/release/deps/ -maxdepth 1 -name 'cachegrind_kernels-*' -type f -executable | head -1)
+          test -n "$BINARY"
+          echo "binary=$BINARY" >> "$GITHUB_OUTPUT"
+      - name: Run cachegrind
+        id: run-cachegrind
+        run: |
+          set -e
+          KERNEL="${{ matrix.kernel }}"
+          INPUT_CLASS="${{ matrix.input_class }}"
+          OUT="cg_${KERNEL}_${INPUT_CLASS}.out"
+          # LOW-1 (v2): --branch-sim=yes adds the conditional + indirect
+          # branch counters (Bc/Bcm/Bi/Bim) to the per-function row. A
+          # data-dependent branch (e.g. an if-condition that depends on
+          # a secret bit) shows up as a non-zero Bc/Bcm delta across
+          # input classes even when the cache-only counters happen to
+          # match.
+          valgrind --tool=cachegrind --branch-sim=yes \
+            --cachegrind-out-file="$OUT" \
+            "${{ steps.locate-binary.outputs.binary }}" \
+            --kernel "$KERNEL" --input-class "$INPUT_CLASS"
+          # cg_annotate's --threshold parameter accepts a value in
+          # [0..20] (a percentage; functions below this percentage of the
+          # primary sort event are hidden). threshold=0 shows every
+          # function that has at least one counter event, which is the
+          # most-inclusive setting and the load-bearing property for the
+          # FN_RE grep below — the kernel wrapper functions are always
+          # the dominant per-function counters in this harness so a
+          # higher threshold would not hide them, but threshold=0 makes
+          # the property bullet-proof against future kernel inlining /
+          # tail-call optimisation that could split a wrapper across
+          # multiple cg_annotate rows.
+          cg_annotate --auto=no --threshold=0 "$OUT" > "${OUT}.annot"
+          # Amendment 2 (v2): FN_RE matches the `#[inline(never)]`
+          # WRAPPER names defined in benches/cachegrind_kernels.rs. The
+          # underlying production kernels are `#[inline]` and would be
+          # inlined into main; the wrappers preserve a separately-
+          # attributed counter row that cg_annotate surfaces. The regex
+          # is anchored on the `cachegrind_kernels::` mangled-symbol
+          # prefix so it matches ONLY the per-function attribution row
+          # — NOT the `Command:` header line (which contains the
+          # `--kernel <name>` argv) or the `Data file:` line (which
+          # contains the cachegrind output filename with the kernel
+          # name embedded). Without the anchor, the `inv_aes_chain`
+          # regex would match three lines (Command + Data file +
+          # function row), and the resulting kernel-row file would
+          # differ trivially across input classes (the Command line
+          # carries `--input-class <c>` which varies by definition).
+          case "$KERNEL" in
+            mul_aes)        FN_RE='cachegrind_kernels::kernel_mul_aes' ;;
+            mul_legacy)     FN_RE='cachegrind_kernels::kernel_mul_legacy' ;;
+            inv_legacy)     FN_RE='cachegrind_kernels::kernel_inv_legacy' ;;
+            inv_aes_chain)  FN_RE='cachegrind_kernels::inv_aes_chain' ;;
+          esac
+          grep -E "$FN_RE" "${OUT}.annot" > "${OUT}.kernel-row" || true
+          # Amendment 2 (v2) sanity gate: if codegen-inlining (or a
+          # rename in the harness) defeats the FN_RE filter, the
+          # kernel-row file ends up empty and the diff job silently
+          # passes (two empty files compare equal). Fail the build here
+          # so the regression is impossible to miss.
+          if [ ! -s "${OUT}.kernel-row" ]; then
+            echo "ERROR: kernel row regex '$FN_RE' matched zero lines in $OUT.annot." >&2
+            echo "Codegen inlining or a wrapper-rename likely defeated the filter." >&2
+            echo "Inspect the cg_annotate output to find the actual function symbol." >&2
+            exit 1
+          fi
+      - name: Upload cachegrind artifacts
+        if: always()
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        with:
+          name: cachegrind-${{ matrix.kernel }}-${{ matrix.input_class }}
+          path: |
+            cg_*.out
+            cg_*.out.annot
+            cg_*.out.kernel-row
+          retention-days: 90
+
+  diff:
+    name: Diff cachegrind counters across input classes
+    needs: cachegrind
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    strategy:
+      # Arch LOW-2 (v2): same forensic posture as the cachegrind job —
+      # surface every kernel's diff outcome, not just the first failure.
+      fail-fast: false
+      matrix:
+        kernel: [mul_aes, mul_legacy, inv_legacy, inv_aes_chain]
+    steps:
+      - name: Download all artifacts for this kernel
+        # Amendment 3 (v2): pin resolved to v4.1.7 (the same pin
+        # .github/workflows/reprobuild.yml uses for
+        # actions/download-artifact). Aligns with reprobuild.yml giving
+        # a single point of truth.
+        uses: actions/download-artifact@65a9edc5881444af0b9093a5e628f2fe47ea3b2e # v4.1.7
+        with:
+          pattern: cachegrind-${{ matrix.kernel }}-*
+          path: artifacts/
+          merge-multiple: true
+      - name: Pairwise diff kernel-row across input classes (BLOCKING)
+        run: |
+          set -e
+          KERNEL="${{ matrix.kernel }}"
+          fail=0
+          # Amendment 1 (v2): C(4,2) = 6 pairwise comparisons per kernel.
+          # Mul kernels use {zero, all-ones, canonical, sample}; inv
+          # kernels use {one, all-ones, canonical, sample} — Zero is
+          # REPLACED with One on the inv side because legacy::inv(0)
+          # returns Err via early-return (the early-return path is a
+          # separate cachegrind signature, NOT the CT property of the
+          # loop kernel body). Total still 24 diffs across 4 kernels.
+          case "$KERNEL" in
+            mul_aes|mul_legacy)
+              pairs="zero:all-ones zero:canonical zero:sample all-ones:canonical all-ones:sample canonical:sample"
+              ;;
+            inv_legacy|inv_aes_chain)
+              pairs="one:all-ones one:canonical one:sample all-ones:canonical all-ones:sample canonical:sample"
+              ;;
+          esac
+          for pair in $pairs; do
+            a="${pair%:*}"
+            b="${pair#*:}"
+            A="artifacts/cg_${KERNEL}_${a}.out.kernel-row"
+            B="artifacts/cg_${KERNEL}_${b}.out.kernel-row"
+            if ! diff -q "$A" "$B" > /dev/null 2>&1; then
+              echo "DIFF DETECTED ($KERNEL, $a vs $b):"
+              diff "$A" "$B" || true
+              fail=1
+            fi
+          done
+          if [ "$fail" = "1" ]; then
+            echo "FATAL: cachegrind counter diff detected on $KERNEL across input classes." >&2
+            echo "This indicates a data-dependent instruction-stream or memory-access pattern" >&2
+            echo "in the kernel — a REAL CT violation. Investigate before merging." >&2
+            exit 1
+          fi
+          echo "PASS: $KERNEL counter rows byte-identical across all input class pairs."

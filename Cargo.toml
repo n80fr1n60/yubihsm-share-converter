@@ -51,6 +51,21 @@ dhat = "0.3"
 # the crate, only test-mode compilation (which cargo-mutants uses).
 mutants = "0.0.3"
 
+# R23-01: cachegrind-driven CT verification harness; runs under
+# `valgrind --tool=cachegrind --branch-sim=yes` in
+# `.github/workflows/cachegrind.yml`. The harness provides its own
+# `fn main()` (takes `--kernel <K> --input-class <C>` argv), so
+# `harness = false` bypasses libtest. The 3 production GF(2^8)
+# kernels (resplit::mul_aes, legacy::mul, legacy::inv) plus a
+# synthetic `inv_aes_chain = mul_aes^254` are wrapped in
+# `#[inline(never)]` functions so cachegrind's per-function
+# attribution can find them. See FIX_PLAN.html #r23-plan + #r23-01
+# + #r23-v2-changelog for full rationale.
+[[bench]]
+name = "cachegrind_kernels"
+path = "benches/cachegrind_kernels.rs"
+harness = false
+
 [profile.release]
 panic = "abort"
 strip = "symbols"
@@ -58,3 +73,23 @@ codegen-units = 1
 lto = "thin"
 overflow-checks = true
 debug = false
+
+# R23-01: cachegrind needs the binary's symbol table (`.symtab` +
+# `.strtab`) AND DWARF line tables so `cg_annotate` can attribute
+# per-function counters (and ideally per-source-line counters too).
+# `cargo bench` inherits `[profile.release]` which sets
+# `strip = "symbols"` — that strips both debuginfo AND symbols,
+# leaving cg_annotate with only `???:???` per-function rows.
+# Empirically `strip = "debuginfo"` was not enough (the merged
+# strip profile-key still wiped `.symtab`); `strip = "none"` is
+# the most aggressive symbol-preservation setting. We also add
+# `debug = "line-tables-only"` to emit DWARF `.debug_line` sections
+# (compact subset of full debuginfo — just file:line maps for each
+# instruction) so cg_annotate can attribute to source lines, not
+# just function names. The emitted instruction bytes are byte-
+# identical to release (strip + debuginfo are post-codegen layout-
+# only changes); production builds remain unaffected.
+[profile.bench]
+inherits = "release"
+strip = "none"
+debug = "line-tables-only"
