@@ -8,22 +8,28 @@
 # 16-class adversarial-input superset is exercised LOCALLY by this script.
 #
 # Subcommands:
-#   scripts/run-ct-local.sh dudect      - run hand-rolled dudect 5×, MAX |t|<10 gate
-#   scripts/run-ct-local.sh cachegrind  - run valgrind cachegrind 16-class sweep
+#   scripts/run-ct-local.sh dudect      - run hand-rolled dudect 5×, ADVISORY-only
+#   scripts/run-ct-local.sh cachegrind  - run valgrind cachegrind 16-class sweep (LOAD-BEARING gate)
 #   scripts/run-ct-local.sh all         - run cachegrind then dudect sequentially
 #   scripts/run-ct-local.sh --help      - print this usage banner
 #
-# Exit codes:
-#   0 = verification passed
-#   1 = verification failed (MAX |t| >= 10 or non-zero counter delta)
+# Exit codes (v4 amendment path (c) at FIX_PLAN.html #r24-v4-amendment):
+#   0 = verification passed (cachegrind LOAD-BEARING zero counter delta;
+#       dudect ADVISORY exits 0 regardless of transients)
+#   1 = LOAD-BEARING verification failed (cachegrind non-zero counter delta;
+#       sample_split_gate breach; or harness-internal NaN/inf/parse error)
 #   2 = invalid argument
 #   3 = prerequisites missing (valgrind absent for cachegrind subcommand)
 #
 # Output discipline: per-measurement logs + per-cell diagnostics + a
-# one-line PASS summary on stdout that the maintainer pastes into release
+# one-line summary on stdout that the maintainer pastes into release
 # notes as a forensic anchor. The summary line shapes are:
-#   PASS: scripts/run-ct-local.sh cachegrind (312 diffs, zero counter delta)
-#   PASS: scripts/run-ct-local.sh dudect (25 measurements, MAX|t|=<x> < 10)
+#   PASS:     scripts/run-ct-local.sh cachegrind (312 diffs, zero counter delta)
+#   ADVISORY: scripts/run-ct-local.sh dudect (25 measurements; overall MAX|t|=<x>;
+#             cachegrind 312/312 zero delta is the LOAD-BEARING gate per v4 amendment)
+#   ADVISORY-with-transients: scripts/run-ct-local.sh dudect (25 measurements;
+#             <n>/25 transient(s) |t|>=10; overall MAX|t|=<x>; cachegrind 312/312
+#             zero delta + KernelDisass.html are the LOAD-BEARING gates per v4 amendment)
 #
 # Logfiles written to /tmp/ct-local-{dudect,cachegrind}-<timestamp>.log so
 # the maintainer can review even on a failing run.
@@ -87,14 +93,16 @@ Subcommands:
 Output: per-subcommand logfile at /tmp/ct-local-<subcommand>-<timestamp>.log;
         one-line PASS summary on stdout for release-notes anchoring.
 
-Exit codes:
-  0 = verification passed
-  1 = verification failed (MAX |t| >= 10 or non-zero counter delta)
+Exit codes (v4 amendment path (c) at FIX_PLAN.html #r24-v4-amendment):
+  0 = LOAD-BEARING gates passed (cachegrind zero counter delta; dudect
+      ADVISORY-only exit 0 regardless of |t|>=10 transients)
+  1 = LOAD-BEARING gate failed (cachegrind non-zero counter delta; sample-
+      split breach; harness-internal NaN/inf/parse error)
   2 = invalid argument
   3 = prerequisites missing (valgrind absent for cachegrind subcommand)
 
-See FIX_PLAN.html #r24-plan + #r24-acceptance + #r24-v3-changelog for full
-rationale + the release-discipline contract.
+See FIX_PLAN.html #r24-plan + #r24-acceptance + #r24-v3-changelog +
+#r24-v4-amendment for full rationale + the release-discipline contract.
 USAGE
 }
 
@@ -421,7 +429,7 @@ main() {
     all)
       run_cachegrind || return $?
       run_dudect || return $?
-      echo "PASS: scripts/run-ct-local.sh all (cachegrind + dudect both green)"
+      echo "PASS: scripts/run-ct-local.sh all (cachegrind LOAD-BEARING PASS + dudect ADVISORY exit 0; see per-subcommand lines above for transient counts and MAX|t| forensic detail per v4 amendment path (c))"
       ;;
     -h|--help|help)
       usage

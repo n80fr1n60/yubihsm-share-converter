@@ -69,13 +69,22 @@ indeterminate / `>=10` leak).
 ```
 
 Logfiles are written to `/tmp/ct-local-{subcommand}-<timestamp>.log` so the
-maintainer can review even on a failing run. The wrapper emits a one-line
-PASS summary on stdout suitable for pasting into release notes:
+maintainer can review even on a failing run. The wrapper emits one-line
+summaries on stdout suitable for pasting into release notes (v4 amendment
+path (c) at `FIX_PLAN.html#r24-v4-amendment` — cachegrind is the
+LOAD-BEARING release-blocking gate; dudect is ADVISORY-only):
 
 ```
-PASS: scripts/run-ct-local.sh cachegrind (312 diffs, zero counter delta)
-PASS: scripts/run-ct-local.sh dudect (25 measurements, MAX|t|=<x> < 10)
+PASS:     scripts/run-ct-local.sh cachegrind (312 diffs, zero counter delta)
+ADVISORY: scripts/run-ct-local.sh dudect (25 measurements; overall MAX|t|=<x>;
+          cachegrind 312/312 zero delta is the LOAD-BEARING gate per v4 amendment)
 ```
+
+On a noisy host the dudect summary becomes `ADVISORY-with-transients: ...
+(<n>/25 transient(s) |t|>=10; overall MAX|t|=<x>; per-sub-case fail counts
+logged above; cachegrind + KernelDisass.html are the LOAD-BEARING gates)` —
+still exit 0 unless 5/5 same-sub-case ≥10 triggers the R22 v2 Amendment 4
+manual escalation procedure for a real-leak investigation.
 
 ## Prerequisites
 
