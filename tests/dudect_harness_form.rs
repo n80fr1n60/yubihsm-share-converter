@@ -165,9 +165,16 @@ fn dudect_harness_form_is_locked() {
     //       from Cargo.toml without updating the harness comment to match).
     //       The directive itself lives in Cargo.toml; here we anchor the
     //       semantic intent in the harness's own docs.
+    //
+    // v4 amendment (architect M-2 fix): explicit parens around the OR so the
+    // assertion is `A && (B || C)`. Pre-v4 the source read `A && B || C`
+    // which Rust parses as `(A && B) || C`; with C present the assertion
+    // would be true regardless of A or B, weakening the defence-in-depth
+    // intent. The corrected form requires `harness` to appear AND at least
+    // one of {`manual \`fn main()\``, `argv-filter`} to appear.
     assert!(
-        body.contains("harness") && body.contains("manual `fn main()`")
-            || body.contains("argv-filter"),
+        body.contains("harness")
+            && (body.contains("manual `fn main()`") || body.contains("argv-filter")),
         "R24-01: harness must document the `harness = false` + manual `fn main()` discipline in source comments per FIX_PLAN.html #r24-01"
     );
 }

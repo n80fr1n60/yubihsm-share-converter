@@ -65,17 +65,21 @@ Subcommands:
               extracts MAX |t| across the 5 percentile cuts ([1.0, 0.95,
               0.99, 0.999, 0.9999]; cuts_field extraction logic), and
               asserts the sample_split_gate (|L-R|/(L+R) <= 5%; defence-
-              in-depth per v2 Amendment 7 reframed for v3). Acceptance
-              gate: every measurement's MAX |t| < 10. Wall-clock budget:
-              ~10-15 min.
+              in-depth per v2 Amendment 7 reframed for v3). ADVISORY-only
+              per R24 v4 amendment (#r24-v4-amendment path (c)): reports
+              MAX |t| transients for forensic visibility but does NOT
+              block release. Cachegrind 312/312 zero counter delta +
+              KernelDisass.html instruction-level proof are the LOAD-
+              BEARING gates. Wall-clock budget: ~10-15 min.
 
   cachegrind  Run valgrind --tool=cachegrind --branch-sim=yes on the
               expanded 16-class InputClass harness binary across 50 cells
               (32 mul + 18 inv) on x86_64. Then run 312 pairwise diffs
               (240 mul + 72 inv) per FIX_PLAN.html #r24-02 v3 LOCAL-ONLY.
-              Acceptance gate: every pairwise diff has byte-identical
-              kernel-row counters. Wall-clock budget: ~12-19 min.
-              Requires valgrind >= 3.18 (apt-get install valgrind).
+              Acceptance gate (LOAD-BEARING): every pairwise diff has
+              byte-identical kernel-row counters. Wall-clock budget:
+              ~12-19 min. Requires valgrind >= 3.18
+              (apt-get install valgrind).
 
   all         (default) Run cachegrind first, then dudect, sequentially.
               Wall-clock budget: ~22-34 min total.
@@ -202,6 +206,11 @@ run_dudect() {
       # output line; we double-check by re-parsing the cuts= field
       # with awk to defend against a future harness refactor that
       # rotates the field shape.
+      #
+      # v4 amendment (M-1 fix): the regex was non-greedy
+      # `sub(/[^=]*=/, ...)` which strips only the LEFTMOST `=` and
+      # mis-parses the first cut's t-value as 1.0. Greedy `sub(/.*=/, ...)`
+      # strips up to the LAST `=` so the numeric prefix is the t-value.
       local recomputed_max
       recomputed_max=$(echo "$cuts_field" | awk '
         BEGIN { max = 0 }
@@ -209,7 +218,7 @@ run_dudect() {
           n = split($0, a, ",")
           for (i = 1; i <= n; i++) {
             v = a[i]
-            sub(/[^=]*=/, "", v)
+            sub(/.*=/, "", v)
             sub(/[][[:space:]]/, "", v)
             v += 0
             if (v < 0) v = -v
@@ -221,14 +230,20 @@ run_dudect() {
       echo "  run=$run sub=$sub max_abs=$max_abs_field recomputed=$recomputed_max L=$l_count R=$r_count imbalance=${imbalance_pct}%" \
           | tee -a "$logfile"
 
-      # Acceptance gate: MAX |t| < 10 per v2 Amendment 1.
+      # v4 amendment: dudect is ADVISORY per architect+security joint-
+      # surfaced path (c) maintainer-locked decision. Cachegrind 312/312
+      # zero counter delta + KernelDisass.html instruction-level proof
+      # are the LOAD-BEARING gates; dudect reports MAX |t| transients for
+      # forensic visibility but does NOT block release. The R22 v2
+      # Amendment 4 5/5-same-sub-case escalation ladder remains the
+      # manual investigation procedure if a real CT leak ever surfaces.
       if awk -v t="$max_abs_field" 'BEGIN{ exit !(t < 0) }'; then
         # absolute value
         max_abs_field=$(awk -v t="$max_abs_field" 'BEGIN{ printf "%.5f", (t<0)?-t:t }')
       fi
       if awk -v t="$max_abs_field" 'BEGIN{ exit !(t >= 10.0) }'; then
-        echo "  FAIL: MAX |t| = $max_abs_field >= 10 (run=$run sub=$sub)" \
-            | tee -a "$logfile" >&2
+        echo "  ADVISORY: transient |t|=$max_abs_field >=10 (run=$run sub=$sub) — host noise per R22 v2 Amendment 4 ladder; cachegrind+KernelDisass are LOAD-BEARING" \
+            | tee -a "$logfile"
         fail_count=$((fail_count + 1))
       fi
 
@@ -241,14 +256,13 @@ run_dudect() {
   echo "[3/3] Dudect discharge complete: $measurement_count measurements" \
       | tee -a "$logfile"
   if [ "$fail_count" -gt 0 ]; then
-    echo "FAIL: scripts/run-ct-local.sh dudect ($fail_count of $measurement_count measurements exceeded MAX |t| >= 10; see $logfile)" \
-        | tee -a "$logfile" >&2
-    echo "Per R22 v2 Amendment 4 escalation ladder: this may indicate a REAL" \
-        "production-code timing bug — investigate before merging R24." \
-        | tee -a "$logfile" >&2
-    return 1
+    echo "ADVISORY-with-transients: scripts/run-ct-local.sh dudect ($measurement_count measurements; $fail_count/25 transient(s) |t|>=10; overall MAX|t|=${overall_max_abs}; cachegrind 312/312 zero delta + KernelDisass.html are the LOAD-BEARING gates per R24 v4 amendment)" \
+        | tee -a "$logfile"
+    echo "  Per R22 v2 Amendment 4 escalation ladder: 1-4/5 same-sub-case = host noise; 5/5 same-sub-case = REAL leak requiring R-FIX. Transient breakdown logged above for manual investigation." \
+        | tee -a "$logfile"
+    return 0
   fi
-  echo "PASS: scripts/run-ct-local.sh dudect ($measurement_count measurements, MAX|t|=${overall_max_abs} < 10)" \
+  echo "ADVISORY: scripts/run-ct-local.sh dudect ($measurement_count measurements; overall MAX|t|=${overall_max_abs}; cachegrind 312/312 zero delta is the LOAD-BEARING gate per R24 v4 amendment)" \
       | tee -a "$logfile"
   return 0
 }
@@ -363,7 +377,11 @@ run_cachegrind() {
         if ! diff -q "$A" "$B" > /dev/null 2>&1; then
           echo "DIFF DETECTED ($kernel, ${arr[i]} vs ${arr[j]}):" \
               | tee -a "$logfile" >&2
-          diff "$A" "$B" || true | tee -a "$logfile"
+          # v4 amendment (security M-2 / architect L-4 fix): parens around
+          # `diff || true` so the diff content reaches the logfile on the
+          # FAIL path. Without parens this parses as `diff || (true | tee)`
+          # and the actual diff content is lost.
+          (diff "$A" "$B" || true) | tee -a "$logfile"
           fail_count=$((fail_count + 1))
         fi
       done

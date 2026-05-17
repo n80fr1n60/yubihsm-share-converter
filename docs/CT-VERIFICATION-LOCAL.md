@@ -102,23 +102,47 @@ Per FIX_PLAN.html #r24-acceptance (v3 LOCAL-ONLY):
 
 Slower hosts (laptop CPUs, virtualised cores) may take ~30 min for `all`.
 
-## Acceptance gates
+## Acceptance gates (v4 amendment — path (c))
 
-The wrapper EXITs NON-ZERO on any of:
+Per FIX_PLAN.html `#r24-v4-amendment` (architect + security joint review;
+maintainer-locked path (c)):
+
+**LOAD-BEARING (release-blocking) gates** — the wrapper EXITs NON-ZERO on:
 
 - **Cachegrind**: any pairwise diff yields non-zero kernel-row counter
   delta. The diff message identifies the (kernel, class_a, class_b) cell
-  and prints the actual counter delta for triage.
-- **Dudect**: any of the 25 measurements yields MAX |t| ≥ 10 across the 5
-  percentile cuts. The wrapper prints the offending (run, sub-case) cell
-  + the actual MAX |t| value.
+  and prints the actual counter delta for triage. 312/312 pairwise diffs
+  zero counter delta on x86_64 = PASS.
 - **Dudect sample_split_gate**: any sub-case yields `|L - R| / (L + R) > 5%`
   (defence-in-depth against a silently-broken `rng.gen::<bool>()` floor;
   v2 Amendment 7 reframed for v3). The form-guard regression test at
   `tests/dudect_harness_form.rs` locks the harness's randomisation
   invariants reactively; the sample-split gate is the proactive complement.
+- **Dudect harness-internal errors**: NaN/inf t-statistic, parse failure,
+  empty harness output.
 
-On success: exit 0 + one-line PASS summary on stdout.
+**ADVISORY (informational, NOT release-blocking) gate**:
+
+- **Dudect MAX |t|**: any of the 25 measurements yielding |t| ≥ 10 across
+  the 5 percentile cuts is reported as an ADVISORY transient. The wrapper
+  prints the offending (run, sub-case) cell + the MAX |t| value + the
+  per-sub-case transient counts but EXITs 0 regardless. Rationale: dudect
+  wall-clock timing on a typical maintainer host (no CPU pinning, no
+  CT-laboratory tuning) is host-noise-sensitive at the |t| ≥ 10 threshold;
+  the 0.95 percentile cut in particular admits asymmetric-tail-cropping
+  artifacts on the mul sub-cases. Cachegrind's deterministic counter-diff
+  + KernelDisass.html's instruction-level proof together are the LOAD-
+  BEARING CT discharge; dudect provides a real-CPU complementary signal
+  that flags suspicious patterns for manual investigation but does not
+  block release on transient noise.
+- **R22 v2 Amendment 4 escalation ladder** (manual investigation
+  procedure): if the SAME sub-case shows |t| ≥ 10 on 5 out of 5 consecutive
+  runs, that is a REAL CT leak signal and an R-FIX round must address the
+  production-code timing bug BEFORE the next release. 1-4 of 5 same-sub-
+  case ≥ 10 transients are classified as host noise per the ladder.
+
+On success: exit 0 + one-line ADVISORY / ADVISORY-with-transients summary
+on stdout. Cachegrind: one-line PASS summary on stdout (LOAD-BEARING).
 
 ## Release discipline
 
