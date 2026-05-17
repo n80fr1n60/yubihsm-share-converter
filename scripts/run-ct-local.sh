@@ -62,11 +62,9 @@ Subcommands:
   dudect      Run the hand-rolled minimal dudect harness 5 consecutive
               times (5 sub-cases × 5 runs = 25 measurements). For each
               measurement, parses the `cuts=` line emitted by the harness,
-              extracts MAX |t| across the 4 percentile cuts ([1.0, 0.99,
-              0.999, 0.9999]; cuts_field extraction logic; v3-followup
-              dropped the over-aggressive 0.95 cut that produced asymmetric-
-              tail-cropping artifacts on the implementer's first discharge),
-              and asserts the sample_split_gate (|L-R|/(L+R) <= 5%; defence-
+              extracts MAX |t| across the 5 percentile cuts ([1.0, 0.95,
+              0.99, 0.999, 0.9999]; cuts_field extraction logic), and
+              asserts the sample_split_gate (|L-R|/(L+R) <= 5%; defence-
               in-depth per v2 Amendment 7 reframed for v3). Acceptance
               gate: every measurement's MAX |t| < 10. Wall-clock budget:
               ~10-15 min.
@@ -149,16 +147,6 @@ run_dudect() {
   local overall_max_abs="0.0"
   local fail_count=0
   local measurement_count=0
-  # v3-followup: per-sub-case failure counters for R22 v2 Amendment 4
-  # escalation ladder. The strict per-measurement gate produced 1-3/25 host-
-  # noise transients on a non-quiet host (mul_aes_ff was the noisiest at
-  # ~15% transient rate; inv_legacy_one was 0%). Cachegrind 312-diff zero
-  # delta + KernelDisass.html instruction-level proof both confirm the
-  # kernels ARE constant-time at the simulator + disassembly axes. Per the
-  # ladder: a sub-case must fail 5/5 to be classified as a real leak;
-  # 1-4/5 is host noise (tracked-for-R25+ with CPU pinning / quieter host).
-  local fail_mul_aes_zero=0 fail_mul_aes_ff=0 fail_mul_legacy_zero=0
-  local fail_mul_legacy_ff=0 fail_inv_legacy_one=0
 
   for run in 1 2 3 4 5; do
     for sub in "${subcases[@]}"; do
@@ -239,16 +227,9 @@ run_dudect() {
         max_abs_field=$(awk -v t="$max_abs_field" 'BEGIN{ printf "%.5f", (t<0)?-t:t }')
       fi
       if awk -v t="$max_abs_field" 'BEGIN{ exit !(t >= 10.0) }'; then
-        echo "  WARN: MAX |t| = $max_abs_field >= 10 (run=$run sub=$sub) [transient — see ladder]" \
+        echo "  FAIL: MAX |t| = $max_abs_field >= 10 (run=$run sub=$sub)" \
             | tee -a "$logfile" >&2
         fail_count=$((fail_count + 1))
-        case "$sub" in
-          dudect_mul_aes_zero)    fail_mul_aes_zero=$((fail_mul_aes_zero + 1)) ;;
-          dudect_mul_aes_ff)      fail_mul_aes_ff=$((fail_mul_aes_ff + 1)) ;;
-          dudect_mul_legacy_zero) fail_mul_legacy_zero=$((fail_mul_legacy_zero + 1)) ;;
-          dudect_mul_legacy_ff)   fail_mul_legacy_ff=$((fail_mul_legacy_ff + 1)) ;;
-          dudect_inv_legacy_one)  fail_inv_legacy_one=$((fail_inv_legacy_one + 1)) ;;
-        esac
       fi
 
       # Track overall max_abs across all measurements.
@@ -259,39 +240,13 @@ run_dudect() {
 
   echo "[3/3] Dudect discharge complete: $measurement_count measurements" \
       | tee -a "$logfile"
-
-  # v3-followup: apply R22 v2 Amendment 4 escalation ladder.
-  # - 5/5 same sub-case >=10 = REAL LEAK -> hard fail (exit 1, R24-FIX needed)
-  # - 1-4/5 same sub-case >=10 = host noise -> WARN but pass
-  # - 0/5 = clean pass
-  local max_subcase_fails=0
-  for c in $fail_mul_aes_zero $fail_mul_aes_ff $fail_mul_legacy_zero \
-           $fail_mul_legacy_ff $fail_inv_legacy_one; do
-    if [ "$c" -gt "$max_subcase_fails" ]; then max_subcase_fails=$c; fi
-  done
-
-  if [ "$max_subcase_fails" -ge 5 ]; then
-    echo "FAIL: scripts/run-ct-local.sh dudect — a sub-case failed 5/5 runs (REAL LEAK per R22 v2 Amendment 4 ladder)" \
+  if [ "$fail_count" -gt 0 ]; then
+    echo "FAIL: scripts/run-ct-local.sh dudect ($fail_count of $measurement_count measurements exceeded MAX |t| >= 10; see $logfile)" \
         | tee -a "$logfile" >&2
-    echo "  Per-sub-case fail counts:" | tee -a "$logfile" >&2
-    echo "    mul_aes_zero: $fail_mul_aes_zero/5  mul_aes_ff: $fail_mul_aes_ff/5  mul_legacy_zero: $fail_mul_legacy_zero/5  mul_legacy_ff: $fail_mul_legacy_ff/5  inv_legacy_one: $fail_inv_legacy_one/5" \
-        | tee -a "$logfile" >&2
-    echo "Per R22 v2 Amendment 4 escalation ladder: 5/5 same-sub-case = REAL" \
-        "production-code timing bug — open R24-FIX BEFORE merging." \
+    echo "Per R22 v2 Amendment 4 escalation ladder: this may indicate a REAL" \
+        "production-code timing bug — investigate before merging R24." \
         | tee -a "$logfile" >&2
     return 1
-  fi
-  if [ "$fail_count" -gt 0 ]; then
-    echo "PASS-with-noise: scripts/run-ct-local.sh dudect ($measurement_count measurements; $fail_count transient(s) >=10; overall MAX|t|=${overall_max_abs}; max same-sub-case=$max_subcase_fails/5 < 5 — host noise per R22 v2 Amendment 4 ladder)" \
-        | tee -a "$logfile"
-    echo "  Per-sub-case fail counts:" | tee -a "$logfile"
-    echo "    mul_aes_zero: $fail_mul_aes_zero/5  mul_aes_ff: $fail_mul_aes_ff/5  mul_legacy_zero: $fail_mul_legacy_zero/5  mul_legacy_ff: $fail_mul_legacy_ff/5  inv_legacy_one: $fail_inv_legacy_one/5" \
-        | tee -a "$logfile"
-    echo "  Cachegrind 312-diff zero counter delta + KernelDisass.html confirm the kernels ARE constant-time." \
-        | tee -a "$logfile"
-    echo "  Tracked-for-R25+: CPU pinning + niceness + quieter host to reduce dudect noise floor on this host." \
-        | tee -a "$logfile"
-    return 0
   fi
   echo "PASS: scripts/run-ct-local.sh dudect ($measurement_count measurements, MAX|t|=${overall_max_abs} < 10)" \
       | tee -a "$logfile"

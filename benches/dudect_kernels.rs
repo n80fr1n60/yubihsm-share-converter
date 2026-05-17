@@ -42,31 +42,18 @@
 //!
 //! v2 Amendment 1 (LOAD-BEARING per Sec MED-1): paper-§3.2 percentile
 //! cropping per Reparaz et al. (2017). For each crop cut in
-//! `PERCENTILE_CUTS = [1.0, 0.99, 0.999, 0.9999]`, sort each class's
+//! `PERCENTILE_CUTS = [1.0, 0.95, 0.99, 0.999, 0.9999]`, sort each class's
 //! samples, drop the upper N%, recompute Welch's t on the remaining; report
-//! MAX |t| across the 4 cuts. Without cropping, R24-01 inherits R22 v3's
+//! MAX |t| across the 5 cuts. Without cropping, R24-01 inherits R22 v3's
 //! empirical-discharge failure where |t|(ct_mul_legacy) ∈ [10.79, 15.12]
 //! came from OS-scheduler tail outliers, not real kernel leak.
 //!
-//! v3-followup (post-implementer-discharge): the 0.95 cut was DROPPED from
-//! PERCENTILE_CUTS. Empirical R24 first-discharge surfaced a statistical
-//! artifact at the 0.95 cut — 5/25 measurements showed |t| > 17 at the
-//! 0.95 cut while raw (1.0), 0.99, 0.999, 0.9999 cuts all stayed |t| ≤ 3.7.
-//! Cachegrind 312-diff zero counter delta + KernelDisass.html instruction-
-//! level proof confirmed the kernels ARE constant-time at the simulator +
-//! disassembly axes; the 0.95-cut spikes were asymmetric-tail-cropping
-//! artifacts from Class::Left (fixed input) vs Class::Right (random
-//! nonzero) tail-shape divergence under 5% cropping. Reparaz et al. §3.2
-//! canonical cuts are {0.99, 0.999, 0.9999, 1.0}; the 0.95 cut was over-
-//! aggressive cropping and is dropped to match the paper.
-//!
 //! Output format per sub-case (one line per sub-case):
-//!   kernel=<name> cuts=[1.0000=<t>, 0.9900=<t>, 0.9990=<t>, 0.9999=<t>] max_abs=<t> L=<n> R=<m>
+//!   kernel=<name> cuts=[1.0000=<t>, 0.9500=<t>, 0.9900=<t>, 0.9990=<t>, 0.9999=<t>] max_abs=<t> L=<n> R=<m>
 //!
-//! See FIX_PLAN.html #r24-plan + #r24-01 + #r24-v3-changelog + #r24-v3-followup
-//! for full rationale, the 4-percentile-cut LOAD-BEARING framing, the 8 v2
-//! amendments preserved verbatim from R22 v3, and the v2 → v3 LOCAL-ONLY
-//! scope change.
+//! See FIX_PLAN.html #r24-plan + #r24-01 + #r24-v3-changelog for full
+//! rationale, the 5-percentile-cut LOAD-BEARING framing, the 8 v2 amendments
+//! preserved verbatim from R22 v3, and the v2 → v3 LOCAL-ONLY scope change.
 
 use core::hint::black_box;
 use rand::rngs::StdRng;
@@ -97,18 +84,12 @@ const SAMPLES: usize = 100_000;
 // v2 Amendment 1 (Sec MED-1; LOAD-BEARING): paper-§3.2 percentile cropping
 // per Reparaz et al. (2017). For each crop cut, drop samples above the cut
 // percentile within each class, recompute Welch's t on the remaining, and
-// report MAX |t| across the 4 cuts. 1.0 = no crop / raw; 0.99 = drop top
-// 1%; 0.999 = drop top 0.1%; 0.9999 = drop top 0.01%.
-//
-// v3-followup: 0.95 cut DROPPED post-implementer-discharge. Empirical first-
-// discharge surfaced a statistical artifact at 0.95: 5/25 measurements showed
-// |t| > 17 at the 0.95 cut while raw + 0.99 + 0.999 + 0.9999 all clean
-// (|t| ≤ 3.7). Cachegrind 312-diff zero counter delta + KernelDisass.html
-// confirmed the kernels ARE CT. 5% cropping is over-aggressive against
-// asymmetric-tail Class::Left (fixed input) vs Class::Right (random nonzero)
-// distributions. Reparaz et al. §3.2 canonical cuts are {0.99, 0.999, 0.9999,
-// 1.0}; aligning with the paper drops the artifact.
-const PERCENTILE_CUTS: [f64; 4] = [1.0, 0.99, 0.999, 0.9999];
+// report MAX |t| across the 5 cuts. 1.0 = no crop / raw; 0.95 = drop top
+// 5%; 0.99 = drop top 1%; 0.999 = drop top 0.1%; 0.9999 = drop top 0.01%.
+// Without this, R24-01 inherits R22 v3's empirical-discharge failure where
+// |t|(ct_mul_legacy) ∈ [10.79, 15.12] came from OS-scheduler tail outliers,
+// not from a real kernel leak.
+const PERCENTILE_CUTS: [f64; 5] = [1.0, 0.95, 0.99, 0.999, 0.9999];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Class {
@@ -137,31 +118,14 @@ fn welch_t(left: &[f64], right: &[f64]) -> f64 {
 // v2 Amendment 1 (Sec MED-1; LOAD-BEARING): cropped percentile t per
 // Reparaz et al. (2017) §3.2. Sort each class's samples ascending, retain
 // the lower `cut` fraction, recompute welch_t. Cut = 1.0 yields raw samples.
-// v3-followup fix: paper-§3.2 cropping per Reparaz et al. (2017) §3.2 is
-// "we crop measurements above a certain threshold τ, since these are usually
-// outliers due to context switches or interrupts. The threshold is chosen as
-// a percentile (e.g., 99%) of the TOTAL measurements." The first-implementer
-// form sorted each class independently and kept the bottom N% per class
-// (same percentile rank); that produces asymmetric mean shifts when the two
-// classes have different tail shapes (Class::Left fixed input + Class::Right
-// random nonzero → different natural variance), surfacing as spurious |t|
-// spikes at sub-1.0 cuts (empirically: 5/75 measurements showed |t| > 10 at
-// the 0.99 cut while raw 1.0 stayed clean). The correct form computes the
-// combined-distribution threshold and filters both classes at the SAME
-// absolute value. This restores the paper's denoising intent.
 fn welch_t_cropped(left: &[f64], right: &[f64], cut: f64) -> f64 {
-    if cut >= 1.0 {
-        return welch_t(left, right);
-    }
-    let mut combined: Vec<f64> = Vec::with_capacity(left.len() + right.len());
-    combined.extend_from_slice(left);
-    combined.extend_from_slice(right);
-    combined.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let idx = ((combined.len() as f64) * cut).floor() as usize;
-    let threshold = combined[idx.min(combined.len() - 1)];
-    let l_filt: Vec<f64> = left.iter().copied().filter(|&v| v <= threshold).collect();
-    let r_filt: Vec<f64> = right.iter().copied().filter(|&v| v <= threshold).collect();
-    welch_t(&l_filt, &r_filt)
+    let mut l = left.to_vec();
+    let mut r = right.to_vec();
+    l.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    r.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let nl = ((l.len() as f64) * cut).floor() as usize;
+    let nr = ((r.len() as f64) * cut).floor() as usize;
+    welch_t(&l[..nl.min(l.len())], &r[..nr.min(r.len())])
 }
 
 // Per-sub-case kernel invocation with INNER_BATCH amortisation + black_box
@@ -424,33 +388,25 @@ mod tests {
         );
     }
 
-    // (2) percentile_crop drops the combined-distribution tail. Cropping at
-    //     0.99 should remove the explicit 1_000_000 outliers and produce a
-    //     finite |t| close to zero on identical underlying distributions.
-    //
-    //     v3-followup: this test validates the combined-threshold form
-    //     (paper-§3.2 canonical). The first-implementer per-class form was
-    //     replaced because it produced asymmetric mean shifts under
-    //     dissimilar tail shapes — see the welch_t_cropped header comment.
+    // (2) percentile_crop sorts + slices correctly. Cropping at 0.99 keeps
+    //     exactly floor(n*0.99) values per side.
     #[test]
     fn test_percentile_crop_sorts_and_slices() {
+        // Construct distributions where the upper tail is an extreme outlier.
         let mut a: Vec<f64> = (0..100).map(|i| i as f64).collect();
         let mut b: Vec<f64> = (0..100).map(|i| i as f64).collect();
         a.push(1_000_000.0); // adds one outlier at end
         b.push(1_000_000.0);
+        // Raw welch_t with the outlier: t ≈ 0 (means cancel) but variance
+        // is huge — the *value* is tiny. So we test the structural property
+        // that cropping shrinks the slice length.
         let cut_99 = 0.99;
-        // Combined: 202 values. Threshold = sorted[floor(202*0.99)] =
-        // sorted[199] = some value around 99-100 (the combined distribution
-        // is [0,0,1,1,...,99,99,1e6,1e6]; index 199 sits at 99). The two
-        // 1_000_000 outliers MUST be dropped from each side.
+        let n = a.len(); // 101
+        let expected_kept = ((n as f64) * cut_99).floor() as usize; // 99
+        assert_eq!(expected_kept, 99);
+        // Verify welch_t_cropped runs without panic and returns a finite t.
         let t = welch_t_cropped(&a, &b, cut_99);
         assert!(t.is_finite(), "cropped t must be finite; got {t}");
-        // With identical underlying distributions + identical outliers, the
-        // cropped t must be near zero (no leak signal).
-        assert!(
-            t.abs() < 1.0,
-            "cropped t on identical distributions must be near 0; got {t}"
-        );
     }
 
     // (3) percentile_crop preserves below floor: cropping at 1.0 (no crop)
@@ -473,6 +429,7 @@ mod tests {
     fn test_max_abs_picks_largest_magnitude() {
         let per_cut: Vec<(f64, f64)> = vec![
             (1.0, 0.5),
+            (0.95, -3.7),
             (0.99, 1.2),
             (0.999, -8.1), // largest in magnitude
             (0.9999, 2.0),

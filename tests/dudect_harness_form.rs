@@ -125,28 +125,16 @@ fn dudect_harness_form_is_locked() {
     // ---- R24 v3 LOCAL-ONLY EXTRA COVERAGE -----------------------------------
     // The wrapper script's empirical discharge is load-bearing; these extra
     // form-guard assertions defend the harness's structural invariants
-    // (exactly 4 percentile cuts post-v3-followup; all 5 sub-cases present;
-    // cuts_field marker for the awk extraction; sample_split_gate marker —
-    // wait, that lives in the wrapper, not the harness; here we anchor the
-    // harness-side markers).
-    //
-    // v3-followup: PERCENTILE_CUTS reduced from 5 to 4 cuts (0.95 dropped).
-    // The 0.95 cut produced statistical artifacts under asymmetric tail
-    // distributions (Class::Left fixed input vs Class::Right random nonzero).
-    // Reparaz et al. §3.2 canonical cuts are {0.99, 0.999, 0.9999, 1.0};
-    // aligning with the paper. See benches/dudect_kernels.rs header for the
-    // full rationale + the FIX_PLAN.html #r24-v3-followup amendment record.
+    // (exactly 5 percentile cuts; all 5 sub-cases present; cuts_field marker
+    // for the awk extraction; sample_split_gate marker — wait, that lives in
+    // the wrapper, not the harness; here we anchor the harness-side markers).
 
-    // (xiii) exactly 4 percentile cuts (no more, no less). Search the
-    //        PERCENTILE_CUTS array literal for the 4 expected values.
+    // (xiii) exactly 5 percentile cuts (no more, no less). Search the
+    //        PERCENTILE_CUTS array literal for the 5 expected values.
     assert!(
-        body.contains("[1.0, 0.99, 0.999, 0.9999]")
-            || body.contains("[1.0,0.99,0.999,0.9999]"),
-        "R24-01 v2 Amendment 1 (v3-followup): PERCENTILE_CUTS must be exactly [1.0, 0.99, 0.999, 0.9999] per Reparaz et al. §3.2; not found"
-    );
-    assert!(
-        !body.contains("0.95, 0.99") && !body.contains("0.95,0.99"),
-        "R24-01 v3-followup: the 0.95 percentile cut MUST NOT reappear in PERCENTILE_CUTS (canonical paper cuts are {{0.99, 0.999, 0.9999, 1.0}})"
+        body.contains("[1.0, 0.95, 0.99, 0.999, 0.9999]")
+            || body.contains("[1.0,0.95,0.99,0.999,0.9999]"),
+        "R24-01 v2 Amendment 1: PERCENTILE_CUTS must be exactly [1.0, 0.95, 0.99, 0.999, 0.9999] per the paper-§3.2 spec; not found"
     );
 
     // (xiv) all 5 sub-cases listed in #r24-01 are present in the source.
