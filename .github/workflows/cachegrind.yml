@@ -48,7 +48,7 @@ env:
 
 jobs:
   cachegrind:
-    name: cachegrind (${{ matrix.os }}: ${{ matrix.kernel }} × ${{ matrix.input_class }})
+    name: "cachegrind (${{ matrix.os }}: ${{ matrix.kernel }} × ${{ matrix.input_class }})"
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -212,7 +212,7 @@ jobs:
           retention-days: 90
 
   diff:
-    name: Diff cachegrind counters across input classes (${{ matrix.os }}: ${{ matrix.kernel }})
+    name: "Diff cachegrind counters across input classes (${{ matrix.os }}: ${{ matrix.kernel }})"
     needs: cachegrind
     # Diff is text-file processing; can run on x86_64 regardless of which
     # arch the artifacts came from. Keep on ubuntu-22.04 for simplicity.
