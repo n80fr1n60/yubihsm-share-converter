@@ -58,10 +58,10 @@ indeterminate / `>=10` leak).
 # Run cachegrind only (~12-19 min on x86_64).
 ./scripts/run-ct-local.sh cachegrind
 
-# Run dudect only (~10-15 min; 5 sub-cases × 5 runs = 25 measurements).
+# Run dudect only (~40-60 min; 5 sub-cases × 20 runs = 100 measurements).
 ./scripts/run-ct-local.sh dudect
 
-# Run both sequentially (~22-34 min total).
+# Run both sequentially (~45-70 min total).
 ./scripts/run-ct-local.sh all
 
 # Print the usage banner.
@@ -76,15 +76,18 @@ LOAD-BEARING release-blocking gate; dudect is ADVISORY-only):
 
 ```
 PASS:     scripts/run-ct-local.sh cachegrind (312 diffs, zero counter delta)
-ADVISORY: scripts/run-ct-local.sh dudect (25 measurements; overall MAX|t|=<x>;
+ADVISORY: scripts/run-ct-local.sh dudect (100 measurements; overall MAX|t|=<x>;
           cachegrind 312/312 zero delta is the LOAD-BEARING gate per v4 amendment)
 ```
 
 On a noisy host the dudect summary becomes `ADVISORY-with-transients: ...
-(<n>/25 transient(s) |t|>=10; overall MAX|t|=<x>; per-sub-case fail counts
+(<n>/100 transient(s) |t|>=10; overall MAX|t|=<x>; per-sub-case fail counts
 logged above; cachegrind + KernelDisass.html are the LOAD-BEARING gates)` —
-still exit 0 unless 5/5 same-sub-case ≥10 triggers the R22 v2 Amendment 4
-manual escalation procedure for a real-leak investigation.
+still exit 0 always (wrapper exits 0 ALWAYS per R26 v4 path (c) ADVISORY-only
+contract preservation; the R22 v2 Amendment 4 5-consecutive-runs ladder remains
+MANUAL investigation procedure — if 5/5 same-sub-case ≥10 appears in any of
+the 16 sliding-window positions across the 20 runs, the maintainer escalates
+to a separate R-FIX round per the manual contract).
 
 ## Prerequisites
 
@@ -99,17 +102,30 @@ The dudect subcommand does NOT require valgrind.
 
 ## Expected wall-clock budget
 
-Per FIX_PLAN.html #r24-acceptance (v3 LOCAL-ONLY):
+Per FIX_PLAN.html #r24-acceptance (v3 LOCAL-ONLY) + #r26-plan + #r26-03
+(R26 post-uplift baseline):
 
 - **Cachegrind**: 50 cells × ~10-15 sec/cell ≈ 8-13 min for the cachegrind
   invocations + ~3-5 min for the 312 pairwise diffs + ~30-60 sec aggregate
-  startup ≈ **~12-19 min** total on x86_64 (~3 GHz, 4 cores).
-- **Dudect**: 5 sub-cases × ~5-6 sec/measurement loop × 5 runs ≈
-  **~10-15 min** (the wrapper amortises the build cost across all 25
-  measurements; the per-measurement wall-clock is dominated by the
-  `SAMPLES = 100_000` × `INNER_BATCH = 1000` kernel-call loops).
+  startup ≈ **~12-19 min** total on x86_64 (~3 GHz, 4 cores). UNCHANGED by
+  R26 (the cachegrind subcommand is byte-identical pre/post-R26 per SD-R26-3).
+- **Dudect**: 5 sub-cases × ~25-30 sec/measurement loop × 20 runs ≈
+  **~40-60 min** on a 5×-faster maintainer host (R26 v2 wall-clock note); up
+  to **~2 hr** on a reference-class 4-core ~3 GHz host. The per-measurement
+  wall-clock is dominated by the `SAMPLES = 1_000_000` (R26-02 uplift from
+  100_000) × `INNER_BATCH = 1000` kernel-call loops; the R26-03 outer-loop
+  uplift (5 → 20 runs) gives the wrapper 100 total measurements (5 × 20) =
+  4× the pre-R26 denominator for the maintainer's MANUAL escalation-ladder
+  pattern-spotting across 16 sliding-window positions.
 
-Slower hosts (laptop CPUs, virtualised cores) may take ~30 min for `all`.
+Slower hosts (laptop CPUs, virtualised cores) may take ~2 hr for `all` in
+the R26 post-uplift regime. The conservative ~2 hr table estimate from the
+R26 plan is the upper bound; ~30-60 min is realistic on a maintainer host
+that is 5×-faster than the reference class.
+
+The dudect lane is ADVISORY-only per R24 v4 amendment path (c) and
+maintainer-locked HIGH-1 (a) preservation in R26 — the wrapper exits 0
+ALWAYS, regardless of transient observations across the 100 measurements.
 
 ## Acceptance gates (v4 amendment — path (c))
 
@@ -132,23 +148,33 @@ maintainer-locked path (c)):
 
 **ADVISORY (informational, NOT release-blocking) gate**:
 
-- **Dudect MAX |t|**: any of the 25 measurements yielding |t| ≥ 10 across
-  the 5 percentile cuts is reported as an ADVISORY transient. The wrapper
-  prints the offending (run, sub-case) cell + the MAX |t| value + the
-  per-sub-case transient counts but EXITs 0 regardless. Rationale: dudect
-  wall-clock timing on a typical maintainer host (no CPU pinning, no
-  CT-laboratory tuning) is host-noise-sensitive at the |t| ≥ 10 threshold;
-  the 0.95 percentile cut in particular admits asymmetric-tail-cropping
-  artifacts on the mul sub-cases. Cachegrind's deterministic counter-diff
-  + KernelDisass.html's instruction-level proof together are the LOAD-
-  BEARING CT discharge; dudect provides a real-CPU complementary signal
-  that flags suspicious patterns for manual investigation but does not
-  block release on transient noise.
-- **R22 v2 Amendment 4 escalation ladder** (manual investigation
-  procedure): if the SAME sub-case shows |t| ≥ 10 on 5 out of 5 consecutive
-  runs, that is a REAL CT leak signal and an R-FIX round must address the
-  production-code timing bug BEFORE the next release. 1-4 of 5 same-sub-
-  case ≥ 10 transients are classified as host noise per the ladder.
+- **Dudect MAX |t|**: any of the 100 measurements (R26-03 uplift; 5 sub-cases
+  × 20 runs) yielding |t| ≥ 10 across the 5 percentile cuts is reported as
+  an ADVISORY transient. The wrapper prints the offending (run, sub-case)
+  cell + the MAX |t| value + the per-sub-case transient counts but EXITs 0
+  regardless. Rationale: dudect wall-clock timing on a typical maintainer
+  host (R26-01 last-core CPU pinning + nice -n -10 applied as probe-then-
+  invoke ADVISORY-only mitigations; no CT-laboratory tuning) is host-noise-
+  sensitive at the |t| ≥ 10 threshold; the 0.95 percentile cut in particular
+  admits asymmetric-tail-cropping artifacts on the mul sub-cases.
+  Cachegrind's deterministic counter-diff + KernelDisass.html's instruction-
+  level proof together are the LOAD-BEARING CT discharge; dudect provides a
+  real-CPU complementary signal that flags suspicious patterns for manual
+  investigation but does not block release on transient noise.
+- **R22 v2 Amendment 4 escalation ladder** (MANUAL investigation procedure;
+  R26-03 preserves the absolute 5-consecutive-runs threshold — NOT
+  relativized to 25% — per SD-R26-7 + maintainer-locked HIGH-1 (a)): if the
+  SAME sub-case shows |t| ≥ 10 on 5 consecutive runs in any of the 16
+  sliding-window positions across the 20 runs (runs 1-5, 2-6, ..., 16-20),
+  that is a REAL CT leak signal and a separate R-FIX round must address the
+  production-code timing bug BEFORE the next release. 0-4 of 5 same-sub-
+  case ≥ 10 transients in any sliding window are classified as host noise
+  per the ladder. The wrapper does NOT contain a programmatic 5-consecutive-
+  runs sliding-window scanner — the 20-run regime simply gives the maintainer
+  16 sliding-window positions to scan in the per-(run, sub-case) transient
+  forensic output emitted at the bottom of `run_dudect()`. The wrapper exits
+  0 ALWAYS on the dudect lane (ADVISORY-only contract per R24 v4 path (c)
+  preservation in R26).
 
 On success: exit 0 + one-line ADVISORY / ADVISORY-with-transients summary
 on stdout. Cachegrind: one-line PASS summary on stdout (LOAD-BEARING).
@@ -171,17 +197,25 @@ invocation).
 
 ## Escalation ladder (`|t| ≥ 10` or non-zero counter delta)
 
-Per FIX_PLAN.html #r22-v2-changelog Amendment 4 + #r24-acceptance v3:
+Per FIX_PLAN.html #r22-v2-changelog Amendment 4 + #r24-acceptance v3 +
+#r26-03 (R26 post-uplift denominator):
 
 1. **Re-run on the same local host with the same seed**. The deterministic
    seed `DUDECT_RNG_SEED = 0x756e6963_6f72_6e75` makes the run
    reproducible. A `|t| ≥ 10` on a single noisy sample MAY be a runner-side
-   tail outlier; the 5× re-run amortises this.
+   tail outlier; the 20× re-run regime (R26-03 uplift from 5×) amortises
+   this across 16 sliding-window positions (runs 1-5, 2-6, ..., 16-20).
 
-2. **If 5 of 5 re-runs report `|t| ≥ 10` on the same sub-case**: this is a
-   REAL production-code timing bug. Surface it as a separate R24-FIX round
-   to fix the production code BEFORE the R24 commit lands. Do NOT modify
-   the harness to suppress the signal.
+2. **If 5 consecutive same-sub-case |t| ≥ 10 transients appear in ANY of
+   the 16 sliding-window positions** across the 20 runs: this is a REAL
+   production-code timing bug per the R22 v2 Amendment 4 absolute 5/5
+   threshold (preserved in R26-03 per SD-R26-7 + maintainer-locked HIGH-1
+   (a) — NOT relativized to 25%). Surface it as a separate R-FIX round
+   to fix the production code BEFORE the next release tag. Do NOT modify
+   the harness to suppress the signal. The wrapper does NOT contain a
+   programmatic 5-consecutive-runs sliding-window scanner; this step is a
+   MANUAL human review of the per-(run, sub-case) transient forensic
+   output emitted at the bottom of `run_dudect()`.
 
 3. **If cachegrind reports a non-zero counter delta**: this is deterministic,
    not statistical — re-run is not load-bearing. Investigate the offending

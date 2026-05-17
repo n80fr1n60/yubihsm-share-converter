@@ -75,11 +75,15 @@ const DUDECT_RNG_SEED: u64 = 0x756e_6963_6f72_6e75;
 // CLOCK_MONOTONIC resolution floor.
 const INNER_BATCH: usize = 1000;
 
-// SD-R24-3 (a): CI-budget-derived per the R22 SUPERSEDED plan body's INFO-2
-// note; tracked-for-R25+ uplift to 1M-10M if MAX |t| consistently sits in
-// 3-9 range across 5 consecutive runs (indicating sub-cycle leak the 100K
-// SAMPLES floor can't resolve).
-const SAMPLES: usize = 100_000;
+// SD-R26-4 (a): SAMPLES uplift 100_000 → 1_000_000 per R26-02. Welch's t
+// standard error per measurement is proportional to 1/sqrt(SAMPLES); the
+// 10× uplift tightens it by sqrt(10) ≈ 3.16× (sub-cycle leaks the prior
+// 100K floor masked as noise are now resolvable at the standard-error
+// level). Form-guard at tests/dudect_harness_form.rs locks SAMPLES ≥
+// 1_000_000 per SD-R26-8 (forbid accidental downgrade). Tracked-for-R27+
+// uplift to 5M-10M if MAX |t| consistently sits in 5-9 range across 5
+// consecutive runs (sub-cycle leak floor the 1M baseline can't resolve).
+const SAMPLES: usize = 1_000_000;
 
 // v2 Amendment 1 (Sec MED-1; LOAD-BEARING): paper-§3.2 percentile cropping
 // per Reparaz et al. (2017). For each crop cut, drop samples above the cut

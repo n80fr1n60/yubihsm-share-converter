@@ -8,14 +8,18 @@
 # 16-class adversarial-input superset is exercised LOCALLY by this script.
 #
 # Subcommands:
-#   scripts/run-ct-local.sh dudect      - run hand-rolled dudect 5×, ADVISORY-only
+#   scripts/run-ct-local.sh dudect      - run hand-rolled dudect 20×, ADVISORY-only
 #   scripts/run-ct-local.sh cachegrind  - run valgrind cachegrind 16-class sweep (LOAD-BEARING gate)
 #   scripts/run-ct-local.sh all         - run cachegrind then dudect sequentially
 #   scripts/run-ct-local.sh --help      - print this usage banner
 #
-# Exit codes (v4 amendment path (c) at FIX_PLAN.html #r24-v4-amendment):
+# Exit codes (v4 amendment path (c) at FIX_PLAN.html #r24-v4-amendment;
+# R26-01 pinning/niceness are ADVISORY-only — failure to probe taskset
+# or to elevate niceness logs a warning + continues at default scheduling;
+# does NOT affect exit codes):
 #   0 = verification passed (cachegrind LOAD-BEARING zero counter delta;
-#       dudect ADVISORY exits 0 regardless of transients)
+#       dudect ADVISORY exits 0 regardless of transients; R26-01 pinning
+#       + niceness ADVISORY-only — degraded probe still exits 0)
 #   1 = LOAD-BEARING verification failed (cachegrind non-zero counter delta;
 #       sample_split_gate breach; or harness-internal NaN/inf/parse error)
 #   2 = invalid argument
@@ -25,10 +29,10 @@
 # one-line summary on stdout that the maintainer pastes into release
 # notes as a forensic anchor. The summary line shapes are:
 #   PASS:     scripts/run-ct-local.sh cachegrind (312 diffs, zero counter delta)
-#   ADVISORY: scripts/run-ct-local.sh dudect (25 measurements; overall MAX|t|=<x>;
+#   ADVISORY: scripts/run-ct-local.sh dudect (100 measurements; overall MAX|t|=<x>;
 #             cachegrind 312/312 zero delta is the LOAD-BEARING gate per v4 amendment)
-#   ADVISORY-with-transients: scripts/run-ct-local.sh dudect (25 measurements;
-#             <n>/25 transient(s) |t|>=10; overall MAX|t|=<x>; cachegrind 312/312
+#   ADVISORY-with-transients: scripts/run-ct-local.sh dudect (100 measurements;
+#             <n>/100 transient(s) |t|>=10; overall MAX|t|=<x>; cachegrind 312/312
 #             zero delta + KernelDisass.html are the LOAD-BEARING gates per v4 amendment)
 #
 # Logfiles written to /tmp/ct-local-{dudect,cachegrind}-<timestamp>.log so
@@ -36,8 +40,11 @@
 #
 # Empirical wall-clock budget (x86_64 local host, 4-core ~3 GHz):
 #   cachegrind: ~12-19 min (50 cells × ~10-15 sec/cell + ~3-5 min diffs)
-#   dudect:     ~10-15 min (5 sub-cases × ~25-30 sec/run × 5 runs)
-#   all:        ~22-34 min total
+#   dudect:     ~40-60 min (5 sub-cases × ~25-30 sec/run × 20 runs at
+#               SAMPLES = 1_000_000 per sub-case; R26 v2 wall-clock note:
+#               30-60 min realistic on a 5×-faster host vs the conservative
+#               ~2 hr ceiling for reference-class hosts)
+#   all:        ~45-70 min total
 #
 # Release discipline (per FIX_PLAN.html #r24-v3-changelog Amendment G):
 # the maintainer runs `./scripts/run-ct-local.sh all` BEFORE staging the
@@ -65,8 +72,8 @@ USAGE:
   scripts/run-ct-local.sh --help
 
 Subcommands:
-  dudect      Run the hand-rolled minimal dudect harness 5 consecutive
-              times (5 sub-cases × 5 runs = 25 measurements). For each
+  dudect      Run the hand-rolled minimal dudect harness 20 consecutive
+              times (5 sub-cases × 20 runs = 100 measurements). For each
               measurement, parses the `cuts=` line emitted by the harness,
               extracts MAX |t| across the 5 percentile cuts ([1.0, 0.95,
               0.99, 0.999, 0.9999]; cuts_field extraction logic), and
@@ -76,7 +83,7 @@ Subcommands:
               MAX |t| transients for forensic visibility but does NOT
               block release. Cachegrind 312/312 zero counter delta +
               KernelDisass.html instruction-level proof are the LOAD-
-              BEARING gates. Wall-clock budget: ~10-15 min.
+              BEARING gates. Wall-clock budget: ~40-60 min.
 
   cachegrind  Run valgrind --tool=cachegrind --branch-sim=yes on the
               expanded 16-class InputClass harness binary across 50 cells
@@ -88,7 +95,7 @@ Subcommands:
               (apt-get install valgrind).
 
   all         (default) Run cachegrind first, then dudect, sequentially.
-              Wall-clock budget: ~22-34 min total.
+              Wall-clock budget: ~45-70 min total.
 
 Output: per-subcommand logfile at /tmp/ct-local-<subcommand>-<timestamp>.log;
         one-line PASS summary on stdout for release-notes anchoring.
@@ -153,17 +160,35 @@ run_dudect() {
     dudect_inv_legacy_one
   )
 
-  echo "[2/3] Running dudect harness 5× across 5 sub-cases (25 measurements)..." \
+  echo "[2/3] Running dudect harness 20× across 5 sub-cases (100 measurements)..." \
       | tee -a "$logfile"
 
   local overall_max_abs="0.0"
   local fail_count=0
   local measurement_count=0
 
-  for run in 1 2 3 4 5; do
+  # R26-01 v4 (path c, ADVISORY-only) probe-then-invoke for scheduling tools.
+  # Probes taskset + nice ONCE at start of run_dudect; per-iteration
+  # invocation runs ONCE. See FIX_PLAN.html #r26-01 + MED-1 fix.
+  local pin_cmd=""
+  local nice_cmd=""
+  if command -v taskset >/dev/null 2>&1; then
+    pin_cmd="taskset -c $(($(nproc) - 1))"
+    echo "  pin: $pin_cmd (last core; lower IRQ load on stock Linux)" | tee -a "$logfile"
+  else
+    echo "  warn: taskset not available; running unpinned (ADVISORY signal less clean)" | tee -a "$logfile"
+  fi
+  if command -v nice >/dev/null 2>&1 && nice -n -10 true 2>/dev/null; then
+    nice_cmd="nice -n -10"
+    echo "  nice: $nice_cmd (probe succeeded)" | tee -a "$logfile"
+  else
+    echo "  warn: nice -n -10 probe failed (CAP_SYS_NICE absent or 'nice' not in PATH); running at default niceness (ADVISORY signal less clean)" | tee -a "$logfile"
+  fi
+
+  for run in {1..20}; do
     for sub in "${subcases[@]}"; do
       local raw
-      raw=$("$binary" --kernel "$sub" 2>&1 | tee -a "$logfile")
+      raw=$($pin_cmd $nice_cmd "$binary" --kernel "$sub" 2>&1 | tee -a "$logfile")
       measurement_count=$((measurement_count + 1))
 
       # Parse the harness's output line:
@@ -264,9 +289,9 @@ run_dudect() {
   echo "[3/3] Dudect discharge complete: $measurement_count measurements" \
       | tee -a "$logfile"
   if [ "$fail_count" -gt 0 ]; then
-    echo "ADVISORY-with-transients: scripts/run-ct-local.sh dudect ($measurement_count measurements; $fail_count/25 transient(s) |t|>=10; overall MAX|t|=${overall_max_abs}; cachegrind 312/312 zero delta + KernelDisass.html are the LOAD-BEARING gates per R24 v4 amendment)" \
+    echo "ADVISORY-with-transients: scripts/run-ct-local.sh dudect ($measurement_count measurements; $fail_count/100 transient(s) |t|>=10; overall MAX|t|=${overall_max_abs}; cachegrind 312/312 zero delta + KernelDisass.html are the LOAD-BEARING gates per R24 v4 amendment)" \
         | tee -a "$logfile"
-    echo "  Per R22 v2 Amendment 4 escalation ladder: 1-4/5 same-sub-case = host noise; 5/5 same-sub-case = REAL leak requiring R-FIX. Transient breakdown logged above for manual investigation." \
+    echo "  Per R22 v2 Amendment 4 escalation ladder (MANUAL investigation per R26-03 + maintainer-locked HIGH-1 (a)): 1-4/5 same-sub-case = host noise; 5/5 same-sub-case in any of the 16 sliding-window positions (runs 1-5, 2-6, ..., 16-20) = REAL leak requiring R-FIX. Transient breakdown logged above for manual investigation; the wrapper exits 0 ALWAYS — no programmatic 5-consecutive-runs scanner." \
         | tee -a "$logfile"
     return 0
   fi

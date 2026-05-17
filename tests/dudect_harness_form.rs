@@ -177,4 +177,16 @@ fn dudect_harness_form_is_locked() {
             && (body.contains("manual `fn main()`") || body.contains("argv-filter")),
         "R24-01: harness must document the `harness = false` + manual `fn main()` discipline in source comments per FIX_PLAN.html #r24-01"
     );
+
+    // (xvii) R26-02 v4 path (c) — SAMPLES floor lock per SD-R26-8.
+    // Forbid accidental downgrade below 1M; the LOAD-BEARING gate is
+    // cachegrind 312/312 (R24 v4) and dudect signal strength is
+    // proportional to 1/sqrt(SAMPLES). See FIX_PLAN.html #r26-02 +
+    // SD-R26-8.
+    assert!(
+        body.contains("const SAMPLES: usize = 1_000_000;")
+            || body.contains("const SAMPLES: usize = 10_000_000;"),
+        "R26-02: SAMPLES floor lock — benches/dudect_kernels.rs must declare \
+         const SAMPLES: usize = 1_000_000 or higher (forbid downgrade)"
+    );
 }
