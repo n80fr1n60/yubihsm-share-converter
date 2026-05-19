@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
-# R24 v3 LOCAL-ONLY: maintainer-runnable CT-verification wrapper script.
+# R24 v3 + R25-01 LOCAL-ONLY: maintainer-runnable CT-verification wrapper.
 #
 # Mirrors the existing scripts/run-proofs.sh subcommand-dispatch convention.
 # THE load-bearing CT-verification surface per FIX_PLAN.html #r24-plan +
-# #r24-acceptance v3 — no new CI/CD workflow files are created; the existing
-# R23 cachegrind.yml workflow stays UNCHANGED at its 5-class matrix; the
-# 16-class adversarial-input superset is exercised LOCALLY by this script.
+# #r24-acceptance v3 + #r25-plan + #r25-01 — no new CI/CD workflow files are
+# created; the existing R23 cachegrind.yml workflow stays UNCHANGED at its
+# 5-class matrix; the 16-class adversarial-input superset (R24-02) + the
+# TIMECOP-style memcheck-taint sweep (R25-01) are exercised LOCALLY by this
+# script.
 #
 # Subcommands:
 #   scripts/run-ct-local.sh dudect      - run hand-rolled dudect 20×, ADVISORY-only
 #   scripts/run-ct-local.sh cachegrind  - run valgrind cachegrind 16-class sweep (LOAD-BEARING gate)
-#   scripts/run-ct-local.sh all         - run cachegrind then dudect sequentially
+#   scripts/run-ct-local.sh memcheck    - run valgrind memcheck-taint 5×N=3 sweep (R25-01; LOAD-BEARING gate)
+#   scripts/run-ct-local.sh all         - run cachegrind + dudect + memcheck sequentially
 #   scripts/run-ct-local.sh --help      - print this usage banner
 #
 # Exit codes (v4 amendment path (c) at FIX_PLAN.html #r24-v4-amendment;
@@ -65,10 +68,10 @@ TIMESTAMP=$(date -u +%Y%m%dT%H%M%SZ)
 
 usage() {
   cat <<'USAGE'
-scripts/run-ct-local.sh - R24 v3 LOCAL-ONLY CT-verification wrapper
+scripts/run-ct-local.sh - R24 v3 + R25-01 LOCAL-ONLY CT-verification wrapper
 
 USAGE:
-  scripts/run-ct-local.sh [dudect|cachegrind|all]   (default: all)
+  scripts/run-ct-local.sh [dudect|cachegrind|memcheck|all]   (default: all)
   scripts/run-ct-local.sh --help
 
 Subcommands:
@@ -82,8 +85,9 @@ Subcommands:
               per R24 v4 amendment (#r24-v4-amendment path (c)): reports
               MAX |t| transients for forensic visibility but does NOT
               block release. Cachegrind 312/312 zero counter delta +
-              KernelDisass.html instruction-level proof are the LOAD-
-              BEARING gates. Wall-clock budget: ~40-60 min.
+              KernelDisass.html instruction-level proof + R25-01 memcheck-
+              taint are the LOAD-BEARING gates. Wall-clock budget:
+              ~40-60 min.
 
   cachegrind  Run valgrind --tool=cachegrind --branch-sim=yes on the
               expanded 16-class InputClass harness binary across 50 cells
@@ -94,22 +98,41 @@ Subcommands:
               ~12-19 min. Requires valgrind >= 3.18
               (apt-get install valgrind).
 
-  all         (default) Run cachegrind first, then dudect, sequentially.
-              Wall-clock budget: ~45-70 min total.
+  memcheck    Run TIMECOP-style memcheck-taint sweep (R25-01) — invoke
+              valgrind --tool=memcheck on the memcheck_kernels harness for
+              each of the 5 sub-cases × N=3 = 15 invocations on x86_64.
+              The harness marks secret bytes as undefined via the
+              VALGRIND_MAKE_MEM_UNDEFINED client request (hand-rolled
+              inline-asm FFI macro); any branch / memory-address / store
+              dependent on the tainted bytes triggers a memcheck warning.
+              Acceptance gate (LOAD-BEARING per SD-R25-5): zero un-
+              suppressed warnings across all 15 invocations =
+              exit 0 (PASS). Suppressions for documented legitimate non-
+              leak code live in valgrind/memcheck-suppressions.txt per
+              MEDIUM-4 override-path procedure. Wall-clock budget:
+              ~2-5 min. Requires valgrind >= 3.18.
+
+  all         (default) Run cachegrind, dudect, then memcheck sequentially.
+              Wall-clock budget: ~45-75 min total.
 
 Output: per-subcommand logfile at /tmp/ct-local-<subcommand>-<timestamp>.log;
         one-line PASS summary on stdout for release-notes anchoring.
 
-Exit codes (v4 amendment path (c) at FIX_PLAN.html #r24-v4-amendment):
-  0 = LOAD-BEARING gates passed (cachegrind zero counter delta; dudect
-      ADVISORY-only exit 0 regardless of |t|>=10 transients)
-  1 = LOAD-BEARING gate failed (cachegrind non-zero counter delta; sample-
-      split breach; harness-internal NaN/inf/parse error)
+Exit codes (v4 amendment path (c) at FIX_PLAN.html #r24-v4-amendment;
+SD-R25-5 LOAD-BEARING for memcheck):
+  0 = LOAD-BEARING gates passed (cachegrind zero counter delta; memcheck
+      zero un-suppressed warnings; dudect ADVISORY-only exit 0 regardless
+      of |t|>=10 transients)
+  1 = LOAD-BEARING gate failed (cachegrind non-zero counter delta;
+      memcheck un-suppressed warning; sample-split breach; harness-
+      internal NaN/inf/parse error)
   2 = invalid argument
-  3 = prerequisites missing (valgrind absent for cachegrind subcommand)
+  3 = prerequisites missing (valgrind absent for cachegrind or memcheck
+      subcommand)
 
 See FIX_PLAN.html #r24-plan + #r24-acceptance + #r24-v3-changelog +
-#r24-v4-amendment for full rationale + the release-discipline contract.
+#r24-v4-amendment + #r25-plan + #r25-01 for full rationale + the
+release-discipline contract.
 USAGE
 }
 
@@ -440,6 +463,121 @@ run_cachegrind() {
 }
 
 # ============================================================================
+# MEMCHECK subcommand (R25-01; LOAD-BEARING per SD-R25-5)
+# ============================================================================
+# TIMECOP-style memcheck-taint sweep: marks secret bytes as undefined via
+# the VALGRIND_MAKE_MEM_UNDEFINED client request (hand-rolled inline-asm FFI
+# macro in benches/memcheck_kernels.rs), then runs each sub-case under
+# valgrind --tool=memcheck. Any "Conditional jump or move depends on
+# uninitialised value(s)" warning or "Use of uninitialised value of size N"
+# warning is a CT-leak signal pointing to the EXACT source line.
+#
+# LOAD-BEARING per SD-R25-5: the wrapper exits 1 on any un-suppressed
+# warning; documented legitimate non-leak code (e.g., the inv() domain-
+# error guard at src/legacy.rs:115) is suppressed via
+# valgrind/memcheck-suppressions.txt per MEDIUM-4 override-path procedure.
+#
+# Probe-then-invoke pattern (mirror R26 MED-1 precedent): probe `command
+# -v valgrind` at start; exit 3 (prerequisites-missing) if absent.
+run_memcheck() {
+  local logfile="/tmp/ct-local-memcheck-${TIMESTAMP}.log"
+  echo "[R25-01 memcheck local discharge] log: ${logfile}"
+  : > "$logfile"
+
+  # Prerequisite check: valgrind must be installed (same exit code 3 as
+  # the cachegrind subcommand for consistency).
+  if ! command -v valgrind >/dev/null 2>&1; then
+    echo "ERROR: valgrind not installed (apt-get install valgrind)" \
+        | tee -a "$logfile" >&2
+    return 3
+  fi
+  echo "  valgrind: $(valgrind --version)" | tee -a "$logfile"
+
+  echo "[1/3] Building memcheck_kernels (bench profile, locked)..." \
+      | tee -a "$logfile"
+  ( cd "$REPO_ROOT" && cargo bench --no-run --bench memcheck_kernels --locked ) \
+      2>&1 | tee -a "$logfile"
+
+  local binary
+  binary=$(locate_bench_binary memcheck_kernels) || return 3
+  echo "  binary: $binary" | tee -a "$logfile"
+
+  local SUPP="${REPO_ROOT}/valgrind/memcheck-suppressions.txt"
+  if [ ! -f "$SUPP" ]; then
+    echo "ERROR: suppressions file not found at $SUPP (MEDIUM-4 override- path file)" \
+        | tee -a "$logfile" >&2
+    return 1
+  fi
+  echo "  suppressions: $SUPP" | tee -a "$logfile"
+
+  local subcases=(
+    memcheck_mul_aes_zero
+    memcheck_mul_aes_ff
+    memcheck_mul_legacy_zero
+    memcheck_mul_legacy_ff
+    memcheck_inv_legacy_one
+  )
+
+  echo "[2/3] Running 5 sub-cases × N=3 = 15 memcheck-taint invocations \
+(BINARY signal per MEDIUM-3)..." | tee -a "$logfile"
+
+  local pass_count=0
+  local fail_count=0
+  local invocation_count=0
+  # N=3 per sub-case for fail-loud robustness against transient PRNG-state
+  # effects (MEDIUM-3 clarification; NOT a SAMPLES sweep).
+  for sub in "${subcases[@]}"; do
+    for iter in 1 2 3; do
+      invocation_count=$((invocation_count + 1))
+      echo "  invocation $invocation_count/15: kernel=$sub iter=$iter" \
+          | tee -a "$logfile"
+      # --error-exitcode=1 makes valgrind exit 1 on any un-suppressed error.
+      # --suppressions=$SUPP applies the MEDIUM-4 override-path entries.
+      # --track-origins=yes provides forensic detail when warnings surface.
+      # --read-var-info=yes uses DWARF debuginfo for better attribution.
+      # --leak-check=no skips the heap-leak summary (orthogonal to CT-taint).
+      # --quiet suppresses the per-invocation startup banner (the warnings
+      #   themselves still print on stderr).
+      if valgrind --tool=memcheck \
+                  --error-exitcode=1 \
+                  --track-origins=yes \
+                  --read-var-info=yes \
+                  --leak-check=no \
+                  --quiet \
+                  --suppressions="$SUPP" \
+                  "$binary" --kernel "$sub" 2>&1 | tee -a "$logfile"; then
+        pass_count=$((pass_count + 1))
+        echo "    [PASS] no un-suppressed memcheck warnings for $sub iter=$iter" \
+            | tee -a "$logfile"
+      else
+        fail_count=$((fail_count + 1))
+        echo "    [FAIL] memcheck warnings detected for $sub iter=$iter (see $logfile)" \
+            | tee -a "$logfile" >&2
+      fi
+    done
+  done
+
+  echo "[3/3] Memcheck discharge complete: $invocation_count invocations \
+($pass_count PASS / $fail_count FAIL)" | tee -a "$logfile"
+
+  # LOAD-BEARING per SD-R25-5 planner default: non-zero exit on any FAIL.
+  if [ "$fail_count" -gt 0 ]; then
+    echo "FAIL: scripts/run-ct-local.sh memcheck ($fail_count of $invocation_count \
+invocations surfaced un-suppressed memcheck warnings; see $logfile)" \
+        | tee -a "$logfile" >&2
+    echo "This indicates a data-dependent branch / address / store in a GF(2^8)" \
+        "kernel — a REAL CT violation. Investigate before merging R25." \
+        "Per MEDIUM-4 override-path procedure, legitimate non-leak code can be" \
+        "suppressed via valgrind/memcheck-suppressions.txt with justification" \
+        "+ date." | tee -a "$logfile" >&2
+    return 1
+  fi
+  echo "PASS: scripts/run-ct-local.sh memcheck ($invocation_count invocations, \
+zero taint violations)" | tee -a "$logfile"
+  return 0
+}
+
+# ============================================================================
 # Main dispatch
 # ============================================================================
 main() {
@@ -451,10 +589,14 @@ main() {
     cachegrind)
       run_cachegrind
       ;;
+    memcheck)
+      run_memcheck
+      ;;
     all)
       run_cachegrind || return $?
       run_dudect || return $?
-      echo "PASS: scripts/run-ct-local.sh all (cachegrind LOAD-BEARING PASS + dudect ADVISORY exit 0; see per-subcommand lines above for transient counts and MAX|t| forensic detail per v4 amendment path (c))"
+      run_memcheck || return $?
+      echo "PASS: scripts/run-ct-local.sh all (cachegrind LOAD-BEARING PASS + dudect ADVISORY exit 0 + memcheck LOAD-BEARING PASS; see per-subcommand lines above for transient counts, MAX|t| forensic detail per v4 amendment path (c), and per-invocation memcheck summary per SD-R25-5)"
       ;;
     -h|--help|help)
       usage

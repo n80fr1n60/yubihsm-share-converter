@@ -79,6 +79,19 @@ name = "dudect_kernels"
 path = "benches/dudect_kernels.rs"
 harness = false
 
+# R25-01 LOCAL-ONLY: TIMECOP-style memcheck-taint harness (canonical
+# Bernstein/SUPERCOP convention; same dynamic-taint technique BoringSSL +
+# libsodium use). Marks secret bytes as undefined via the
+# VALGRIND_MAKE_MEM_UNDEFINED client request (hand-rolled inline-asm FFI
+# macro per SD-R25-1 planner default; zero new Cargo deps mirroring
+# R24 v3 + R26 invariant). Invoked via `scripts/run-ct-local.sh memcheck`
+# (LOAD-BEARING local discharge surface per SD-R25-5; no CI workflow per
+# SD-R25-6). See FIX_PLAN.html #r25-plan + #r25-01.
+[[bench]]
+name = "memcheck_kernels"
+path = "benches/memcheck_kernels.rs"
+harness = false
+
 [profile.release]
 panic = "abort"
 strip = "symbols"

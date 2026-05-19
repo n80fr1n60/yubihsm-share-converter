@@ -1,9 +1,10 @@
-# Local CT verification — R24 v3 LOCAL-ONLY
+# Local CT verification — R24 v3 + R25-01 LOCAL-ONLY
 
 This document covers the LOAD-BEARING local constant-time (CT) verification
-surface added in R24 v3. It is the maintainer-runnable counterpart to the
-existing CI lanes; the wrapper script `scripts/run-ct-local.sh` is the
-forensic anchor for every release tag.
+surface added in R24 v3 and extended in R25-01 with TIMECOP-style memcheck-
+taint. It is the maintainer-runnable counterpart to the existing CI lanes;
+the wrapper script `scripts/run-ct-local.sh` is the forensic anchor for
+every release tag.
 
 ## Why local-only?
 
@@ -40,17 +41,33 @@ added**; the existing R23 `cachegrind.yml` workflow stays UNCHANGED at its
 5-class matrix. The 16-class superset + the dudect lane are exercised
 LOCALLY by the maintainer-runnable wrapper script.
 
-## The two lanes
+## The three lanes (R25-01 expansion)
 
-| Lane                | Tool                                | Surface in v3                            |
-|---------------------|-------------------------------------|------------------------------------------|
-| Cachegrind 16-class | `valgrind --tool=cachegrind`        | `benches/cachegrind_kernels.rs`          |
-| Hand-rolled dudect  | `std::time::Instant` + Welch's t    | `benches/dudect_kernels.rs`              |
+| Lane                | Tool                                                  | Surface                            | Posture                |
+|---------------------|-------------------------------------------------------|------------------------------------|------------------------|
+| Cachegrind 16-class | `valgrind --tool=cachegrind`                          | `benches/cachegrind_kernels.rs`    | LOAD-BEARING           |
+| Hand-rolled dudect  | `std::time::Instant` + Welch's t                      | `benches/dudect_kernels.rs`        | ADVISORY (R24 v4)      |
+| Memcheck-taint      | `valgrind --tool=memcheck` + `VALGRIND_MAKE_MEM_UNDEFINED` | `benches/memcheck_kernels.rs` | LOAD-BEARING (SD-R25-5) |
 
 Cachegrind is a deterministic simulator — counter delta = real bug, not flaky
 test. Dudect is a statistical test on wall-clock samples — `|t| < 10` per
 the dudect paper §5.1 tri-zone interpretation (`<5` no-leak / `5..10`
-indeterminate / `>=10` leak).
+indeterminate / `>=10` leak). Memcheck-taint is a deterministic per-byte
+dataflow tracker — any branch / address / store dependent on tainted secret
+bytes triggers a warning pointing to the EXACT source line; canonical
+Bernstein/SUPERCOP convention (codified as TIMECOP; same technique
+BoringSSL + libsodium use). The four-axis CT-verification chain (source-form
++ cachegrind + dudect + KernelDisass.html) becomes a FIVE-axis chain with
+R25-01.
+
+### LOAD-BEARING summary (3 LOAD-BEARING + 1 ADVISORY)
+
+| Axis                                  | Posture                | Wrapper exit on failure       |
+|---------------------------------------|------------------------|-------------------------------|
+| Cachegrind 312/312 zero counter delta | LOAD-BEARING (R24 v4)  | exit 1                        |
+| KernelDisass.html instruction-stream  | LOAD-BEARING (R24 v4)  | manual review (one-shot)      |
+| Memcheck-taint zero warnings          | LOAD-BEARING (R25-01)  | exit 1                        |
+| Dudect MAX `|t|`                      | ADVISORY (R24 v4 path c) | exit 0 ALWAYS                 |
 
 ## How to run
 
@@ -61,7 +78,10 @@ indeterminate / `>=10` leak).
 # Run dudect only (~40-60 min; 5 sub-cases × 20 runs = 100 measurements).
 ./scripts/run-ct-local.sh dudect
 
-# Run both sequentially (~45-70 min total).
+# Run memcheck-taint only (R25-01; ~2-5 min; 5 sub-cases × N=3 = 15 invocations).
+./scripts/run-ct-local.sh memcheck
+
+# Run all three sequentially (~45-75 min total).
 ./scripts/run-ct-local.sh all
 
 # Print the usage banner.
@@ -103,7 +123,7 @@ The dudect subcommand does NOT require valgrind.
 ## Expected wall-clock budget
 
 Per FIX_PLAN.html #r24-acceptance (v3 LOCAL-ONLY) + #r26-plan + #r26-03
-(R26 post-uplift baseline):
+(R26 post-uplift baseline) + #r25-plan (R25-01 memcheck-taint extension):
 
 - **Cachegrind**: 50 cells × ~10-15 sec/cell ≈ 8-13 min for the cachegrind
   invocations + ~3-5 min for the 312 pairwise diffs + ~30-60 sec aggregate
@@ -117,11 +137,16 @@ Per FIX_PLAN.html #r24-acceptance (v3 LOCAL-ONLY) + #r26-plan + #r26-03
   uplift (5 → 20 runs) gives the wrapper 100 total measurements (5 × 20) =
   4× the pre-R26 denominator for the maintainer's MANUAL escalation-ladder
   pattern-spotting across 16 sliding-window positions.
+- **Memcheck-taint (R25-01)**: 5 sub-cases × N=3 = 15 invocations × ~30-50×
+  memcheck overhead × sub-millisecond native kernel cost ≈ **~2-5 min** on
+  x86_64. Per MEDIUM-3 BINARY-signal clarification: memcheck-taint detects
+  on a SINGLE execution; N=3 is for fail-loud robustness against transient
+  PRNG-state effects, NOT a SAMPLES sweep.
 
 Slower hosts (laptop CPUs, virtualised cores) may take ~2 hr for `all` in
 the R26 post-uplift regime. The conservative ~2 hr table estimate from the
 R26 plan is the upper bound; ~30-60 min is realistic on a maintainer host
-that is 5×-faster than the reference class.
+that is 5×-faster than the reference class. R25-01 adds ~2-5 min to `all`.
 
 The dudect lane is ADVISORY-only per R24 v4 amendment path (c) and
 maintainer-locked HIGH-1 (a) preservation in R26 — the wrapper exits 0
@@ -178,6 +203,81 @@ maintainer-locked path (c)):
 
 On success: exit 0 + one-line ADVISORY / ADVISORY-with-transients summary
 on stdout. Cachegrind: one-line PASS summary on stdout (LOAD-BEARING).
+
+## memcheck-taint (R25-01 LOAD-BEARING)
+
+R25-01 adds the canonical Bernstein/SUPERCOP dynamic-taint axis — same
+technique BoringSSL and libsodium use, codified as TIMECOP. The harness at
+`benches/memcheck_kernels.rs` marks each kernel's secret-bearing input
+bytes as "undefined" via the `VALGRIND_MAKE_MEM_UNDEFINED` valgrind client
+request (hand-rolled inline-asm FFI macro per SD-R25-1 (a) planner default;
+zero new Cargo dependencies). When run under `valgrind --tool=memcheck`, any
+branch / memory-address / store whose value depends on the tainted bytes
+triggers a warning pointing to the EXACT source line. The taint propagates
+per-byte through every execution path the kernel actually exercises, so a
+single execution catches leaks that no finite probed input set could.
+
+### How to run
+
+```sh
+./scripts/run-ct-local.sh memcheck
+```
+
+5 sub-cases × N=3 = 15 invocations under valgrind. Wall-clock budget:
+~2-5 min on x86_64 (memcheck overhead ~30-50× native; the kernels are
+sub-millisecond native, so each invocation completes in a few seconds).
+
+### Acceptance gate (LOAD-BEARING per SD-R25-5)
+
+Zero un-suppressed memcheck warnings (any of: "Conditional jump or move
+depends on uninitialised value(s)", "Use of uninitialised value of size N",
+etc.) across all 15 invocations = PASS (wrapper exit 0). Any un-suppressed
+warning = FAIL (wrapper exit 1). The PASS summary line is:
+
+```
+PASS: scripts/run-ct-local.sh memcheck (15 invocations, zero taint violations)
+```
+
+### Override-path procedure (MEDIUM-4)
+
+If memcheck flags legitimate non-leak code (e.g., allocator metadata
+access; panic-formatting paths; documented domain-error guards on a
+kernel), the maintainer's escape hatch is to add an entry to the valgrind
+suppression file at `valgrind/memcheck-suppressions.txt`. Each entry
+requires:
+
+- A justification comment explaining why the flagged code is non-leak.
+- The date the entry was added (YYYY-MM-DD).
+- A reviewer signature line.
+
+Entries are reviewed at each R-round closure for staleness — entries that
+no longer apply (e.g., a libc symbol that was suppressed in glibc 2.36 but
+is no longer flagged in glibc 2.38) are removed at review time.
+
+The wrapper invokes valgrind with `--suppressions=$REPO_ROOT/valgrind/memcheck-suppressions.txt`
+so all documented suppressions apply. The LOAD-BEARING contract is
+preserved: the wrapper continues to exit non-zero on any *un-suppressed*
+warning; the suppression file is for documented exceptions only.
+
+The initial post-R25-01 commit ships a suppression entry for the documented
+`inv(0) -> Err` domain-error guard at `src/legacy.rs:115`: the
+`if a == 0 { return Err(...) }` branch is input-dependent (it tests a byte
+we just tainted) but is DELIBERATE + outside the CT contract (the CT
+property covers `inv` only over the valid GF(2^8) domain `a in [1, 255]`;
+production code never reaches `inv(0)` per R20 + recover-module validation).
+The branchless `a^254` square-and-multiply body is independently verified
+at the cachegrind 16-class + KernelDisass.html instruction-level axes.
+
+### Cross-references (R25-01)
+
+- The cachegrind 312/312 zero counter-delta gate (LOAD-BEARING per R24 v4
+  amendment path (c)) is byte-identical pre/post-R25 — R25 does NOT change
+  that gate's pass/fail semantics; the cachegrind subcommand is UNCHANGED.
+- The dudect ADVISORY-only contract (`./scripts/run-ct-local.sh dudect`
+  exits 0 always) is byte-identical pre/post-R25 — R25 does NOT amend
+  dudect's posture (R24 v4 path (c) + R26 HIGH-1 (a) preserved verbatim).
+- Memcheck-taint adds ONE NEW LOAD-BEARING surface ORTHOGONAL to cachegrind
+  312/312 + KernelDisass.html (3 LOAD-BEARING axes total post-R25).
 
 ## Release discipline
 
