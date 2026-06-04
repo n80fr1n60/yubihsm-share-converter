@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     # H7-3: inherits workflow-default contents: read; no override needed
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install rustup (per-run sha256 verification)
         env:
           TOOLCHAIN: stable
@@ -95,7 +95,7 @@ jobs:
           apt-get install -y --no-install-recommends \
             curl ca-certificates build-essential pkg-config git
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Install rustup (per-run sha256 verification)
         env:
@@ -154,7 +154,7 @@ jobs:
     permissions:
       contents: write   # H7-3: write-token scoped to this job only (publish release artifacts)
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Download all artifacts
         uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v5.0.0
