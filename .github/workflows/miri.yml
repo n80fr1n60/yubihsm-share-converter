@@ -105,7 +105,7 @@ jobs:
     # becomes BLOCKING on push + PR. See docs/MIRI-MAINTENANCE.md §1.
     continue-on-error: ${{ matrix.borrow_model == 'tree' }}
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       # R15-02 / v2 fix L4 / Sec SF-5: [skip miri] label-override guard.
       # Mirrors the saw-proofs.yml [skip saw] idiom but with the stronger
