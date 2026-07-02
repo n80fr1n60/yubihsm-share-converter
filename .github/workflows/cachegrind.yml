@@ -112,7 +112,12 @@ jobs:
             "https://static.rust-lang.org/rustup/dist/${ARCH_TRIPLE}/rustup-init.sha256"
           expected="$(cut -d ' ' -f1 rustup-init.sha256)"
           actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
-          test "$actual" = "$expected"
+          if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+            echo "FATAL: rustup-init sha256 mismatch" >&2
+            echo "expected: $expected" >&2
+            echo "actual  : $actual" >&2
+            exit 1
+          fi
           chmod +x rustup-init
           ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
           rm -f rustup-init rustup-init.sha256
@@ -129,7 +134,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends valgrind=1:3.18.1-1ubuntu2
           valgrind --version
       - name: Build cachegrind harness
-        run: cargo build --release --bench cachegrind_kernels --no-run --locked
+        run: cargo bench --no-run --bench cachegrind_kernels --locked
       - name: Locate harness binary
         id: locate-binary
         run: |
@@ -190,6 +195,11 @@ jobs:
             inv_aes_chain)  FN_RE='cachegrind_kernels::inv_aes_chain' ;;
           esac
           grep -E "$FN_RE" "${OUT}.annot" > "${OUT}.kernel-row" || true
+          # cg_annotate percentages are relative to whole-program totals
+          # and can drift by 0.01% even when the raw per-function event
+          # counters are byte-identical. Keep the full row for forensics,
+          # but diff a normalized row with percentage parentheticals removed.
+          sed -E 's/[[:space:]]+\([ 0-9.]+%\)//g' "${OUT}.kernel-row" > "${OUT}.kernel-counters"
           # Amendment 2 (v2) sanity gate: if codegen-inlining (or a
           # rename in the harness) defeats the FN_RE filter, the
           # kernel-row file ends up empty and the diff job silently
@@ -201,6 +211,7 @@ jobs:
             echo "Inspect the cg_annotate output to find the actual function symbol." >&2
             exit 1
           fi
+          test -s "${OUT}.kernel-counters"
       - name: Upload cachegrind artifacts
         if: always()
         uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
@@ -214,6 +225,7 @@ jobs:
             cg_*.out
             cg_*.out.annot
             cg_*.out.kernel-row
+            cg_*.out.kernel-counters
           retention-days: 90
 
   diff:
@@ -251,7 +263,7 @@ jobs:
           pattern: cachegrind-${{ matrix.os }}-${{ matrix.kernel }}-*
           path: artifacts/
           merge-multiple: true
-      - name: Pairwise diff kernel-row across input classes (BLOCKING)
+      - name: Pairwise diff kernel counters across input classes (BLOCKING)
         run: |
           set -e
           KERNEL="${{ matrix.kernel }}"
@@ -274,8 +286,8 @@ jobs:
           for pair in $pairs; do
             a="${pair%:*}"
             b="${pair#*:}"
-            A="artifacts/cg_${KERNEL}_${a}.out.kernel-row"
-            B="artifacts/cg_${KERNEL}_${b}.out.kernel-row"
+            A="artifacts/cg_${KERNEL}_${a}.out.kernel-counters"
+            B="artifacts/cg_${KERNEL}_${b}.out.kernel-counters"
             if ! diff -q "$A" "$B" > /dev/null 2>&1; then
               echo "DIFF DETECTED ($KERNEL, $a vs $b):"
               diff "$A" "$B" || true
@@ -288,4 +300,4 @@ jobs:
             echo "in the kernel — a REAL CT violation. Investigate before merging." >&2
             exit 1
           fi
-          echo "PASS: $KERNEL counter rows byte-identical across all input class pairs."
+          echo "PASS: $KERNEL raw counter rows byte-identical across all input class pairs."
