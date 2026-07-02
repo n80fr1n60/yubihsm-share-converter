@@ -110,7 +110,7 @@ jobs:
         with:
           egress-policy: audit
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       # R15-02 / v2 fix L4 / Sec SF-5: [skip miri] label-override guard.
       # Mirrors the saw-proofs.yml [skip saw] idiom but with the stronger
