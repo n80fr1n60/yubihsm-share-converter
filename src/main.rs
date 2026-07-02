@@ -2113,13 +2113,25 @@ mod tests {
         // observed live in the `after` snapshot before Drop runs.
         let _profiler = dhat::Profiler::new_heap();
 
-        // Take the MINIMUM delta over a handful of iterations. Parallel-
-        // sibling tests can only ADD to the live-block delta between
-        // before/after — they cannot subtract — so the minimum across
-        // iterations is the tightest upper bound on `recover()`'s own
-        // residue. At least one iteration is expected to run without
-        // any parallel allocation traffic in our test mix.
-        const ITERS: u32 = 16;
+        // Take the MINIMUM delta over repeated iterations. Parallel-
+        // sibling tests share the dhat global allocator, so their
+        // allocations can inflate the live-block delta between
+        // before/after; the minimum across iterations is the tightest
+        // upper bound on `recover()`'s own residue.
+        //
+        // Deflake: a single burst of 16 back-to-back iterations
+        // completes in microseconds — well inside the window where
+        // sibling tests are still allocating — so on a busy machine
+        // EVERY window could be polluted (observed: min_delta == 2 on
+        // a loaded host, passing on re-run). When a window comes back
+        // polluted (delta > 1), sleep briefly before retrying so the
+        // iterations spread past the sibling burst (the whole test
+        // binary finishes in well under the ITERS × SETTLE budget). A
+        // real regression in recover() is unaffected: extra
+        // allocations made by recover() itself appear in EVERY window,
+        // quiet or not, so min_delta stays > 1 and the assert fires.
+        const ITERS: u32 = 64;
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(2);
         let mut min_delta = usize::MAX;
         for _ in 0..ITERS {
             let before = dhat::HeapStats::get();
@@ -2132,11 +2144,14 @@ mod tests {
                         // before the next iteration's `before` snapshot.
             let delta = after.curr_blocks.saturating_sub(before.curr_blocks);
             min_delta = min_delta.min(delta);
-            if min_delta == 0 {
-                // Best possible result; further iterations cannot
-                // improve on this.
+            if min_delta <= 1 {
+                // Within the assertion bound (the blob itself is live
+                // at the `after` snapshot, so a clean iteration shows
+                // delta == 1); further iterations cannot change the
+                // verdict.
                 break;
             }
+            std::thread::sleep(SETTLE);
         }
 
         // The legitimate destination `blob: Vec<u8>` allocation is the
