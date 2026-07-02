@@ -89,6 +89,11 @@ jobs:
       fail-fast: false
     timeout-minutes: 75   # 50min fuzz + setup/teardown headroom
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Skip non-matching cron slot
         # Each cron event runs the entire matrix by default; skip the
         # entries that don't match the scheduled hour. workflow_dispatch

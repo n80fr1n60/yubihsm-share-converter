@@ -83,6 +83,11 @@ jobs:
           - { kernel: inv_legacy,    input_class: zero }
           - { kernel: inv_aes_chain, input_class: zero }
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install rustup (per-run sha256 verification)
         env:
@@ -230,6 +235,11 @@ jobs:
         os: [ubuntu-22.04, ubuntu-22.04-arm]
         kernel: [mul_aes, mul_legacy, inv_legacy, inv_aes_chain]
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Download all artifacts for this kernel
         # Amendment 3 (v2): pin resolved to v4.1.7 (the same pin
         # .github/workflows/reprobuild.yml uses for
