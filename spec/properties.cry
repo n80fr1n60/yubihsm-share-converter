@@ -291,8 +291,8 @@ property lagrange_recover_t3_vectors =
 // + ...)·x + s` because the parenthesisation would matter.
 //
 // SOLVER NOTE: full associativity over [8]×[8]×[8] = 16.7M inputs may
-// require minutes of Z3 time. Workflow sets `:set prover-timeout = 1800`
-// (30 min) as a per-property safety net.
+// require minutes of Z3 time. Workflow sets `:set prover-timeout = 300`
+// (5 min) as a per-property safety net.
 mul_aes_associative : [8] -> [8] -> [8] -> Bit
 property mul_aes_associative a b c =
     mul_aes (mul_aes a b) c == mul_aes a (mul_aes b c)

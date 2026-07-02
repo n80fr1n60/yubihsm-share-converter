@@ -275,6 +275,43 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn mul_aes_associativity_exhaustive() {
+        // mul_aes(mul_aes(a, b), c) == mul_aes(a, mul_aes(b, c)) for every
+        // (a, b, c) ∈ u8 × u8 × u8 — the full 16.7M-triple input
+        // space. Discharges in ~1-3 s on a release-profile build (cargo
+        // test --release). The polynomial used is the AES FIPS-197 0x11B
+        // reduction (mul_aes body at src/resplit.rs:~210).
+        //
+        // Load-bearing for the AES-poly Horner evaluation at
+        // src/resplit.rs:57-64: Horner relies on `mul_aes` being a TRUE
+        // field multiplication, which requires associativity. A non-
+        // associative multiplication would break the polynomial-evaluation
+        // invariant p(x) = ((c_{t-1}·x + c_{t-2})·x + ...)·x + s
+        // because the parenthesisation would matter.
+        //
+        // This test is the load-bearing every-push Rust-side defender of
+        // associativity post-R18-01 (which moved the Cryptol Z3 :prove
+        // mul_aes_associative to offline-only). Mirrors the spec's
+        // `property mul_aes_associative` at spec/properties.cry:296-298.
+        // See R18-03 in FIX_PLAN.html for the v2 rationale.
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                for c in 0u16..=255 {
+                    let a = a as u8;
+                    let b = b as u8;
+                    let c = c as u8;
+                    assert_eq!(
+                        mul_aes(mul_aes(a, b), c),
+                        mul_aes(a, mul_aes(b, c)),
+                        "mul_aes is non-associative at a=0x{a:02x} b=0x{b:02x} c=0x{c:02x}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn mul_aes_distributivity_over_xor_sampled() {
         // mul_aes(a, b ⊕ c) == mul_aes(a, b) ⊕ mul_aes(a, c) over selected
@@ -353,5 +390,19 @@ mod tests {
         // 0x57·16 = 0x57 ⊕ 0xAE ⊕ 0x07 = 0xFE). Two independent pinned
         // products jointly determine the irreducible polynomial.
         assert_eq!(mul_aes(0x57, 0x13), 0xFE);
+    }
+
+    #[test]
+    fn eval_poly_uses_xor_addition_between_terms() {
+        // p(x) = c1*x + secret in GF(2^8)/0x11B. This pins the XOR in
+        // Horner's step, not just the public mul_aes kernel. A bitwise AND
+        // there would silently drop coefficients when the accumulator starts
+        // at zero.
+        let secret = 0xA5;
+        let coeff = 0x5C;
+        let x = 2;
+        let want = mul_aes(coeff, x) ^ secret;
+        assert_eq!(eval_poly(secret, &[coeff], x), want);
+        assert_ne!(want, secret, "chosen coefficient must affect the output");
     }
 }

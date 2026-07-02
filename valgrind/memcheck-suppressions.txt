@@ -1,0 +1,74 @@
+# valgrind/memcheck-suppressions.txt - R25-01 override-path procedure file
+#
+# Per FIX_PLAN.html #r25-01 MEDIUM-4 override-path procedure:
+# If memcheck flags legitimate non-leak code (e.g., allocator metadata access,
+# panic-formatting paths, or documented domain-error guards on a kernel) that's
+# investigated and CONFIRMED to be non-leak, add a valgrind suppression entry
+# here with:
+#   - Justification comment (why this is non-leak)
+#   - Date added (YYYY-MM-DD)
+#   - R-round reviewer signature line
+# Each entry is reviewed at R-round closure for staleness.
+#
+# Empirical R25-01 first-discharge note (2026-05-19): on the
+# `memcheck_inv_legacy_one` sub-case, valgrind --tool=memcheck flags the
+# `if a == 0 { return Err(...) }` domain-error guard at src/legacy.rs:115
+# inside `pub fn inv(a: u8) -> Result<u8, &'static str>`. The branch IS
+# input-dependent (it tests the byte we just marked as tainted), but it is
+# DELIBERATE + DOCUMENTED + outside the CT contract:
+#   - The CT property covers `inv(a)` only for the valid GF(2^8) domain
+#     `a in [1, 255]` (the multiplicative inverse exists only for nonzero
+#     field elements). `inv(0)` returns Err by design.
+#   - R23 cachegrind harness explicitly filters `a == 0` out of its input
+#     classes (R23 v2 Amendment 1). R24-01 dudect uses `Class::Right` with
+#     `a in [1, 255]` (R22 v3 Sec MED-3 nonzero filter; see the comment in
+#     benches/dudect_kernels.rs:measure_inv_legacy).
+#   - Production code never reaches `inv(0)` because the recover module
+#     validates share x-coordinates are nonzero before invoking inv() on
+#     coefficient denominators (R20 + the recover module's validation).
+#   - The post-guard square-and-multiply body is fully branchless (R12-C-04
+#     branchless a^254; KernelDisass.html shows zero `jcc`/`cmov-on-secret`
+#     in the loop body itself).
+# Suppressing this single warning preserves the LOAD-BEARING memcheck-taint
+# gate: any NEW warning (on a kernel body line, or on `mul`/`mul_aes`) is
+# still surfaced + still fails the wrapper. The cachegrind 312/312 zero
+# counter-delta + KernelDisass.html LOAD-BEARING gates are also preserved
+# (and they exercise the same kernels with the documented `a in [1, 255]`
+# input filter, surfacing the same CT property at orthogonal axes).
+#
+# Suppression-entry matcher shape: `fun:*kernel_inv_legacy*` (mangled rust
+# symbol with wildcard across the build-hash suffix `17h<hash>E`).
+# The wildcard suppresses any frame whose name contains `kernel_inv_legacy`,
+# which is restricted to the harness wrapper at benches/memcheck_kernels.rs;
+# no production symbol could match because `pub fn inv` is `#[inline]`-
+# inlined and never appears as a callable top stack frame.
+#
+# Note: an earlier draft of this file (R25-01 implementer first-discharge)
+# also included `fun:inv` matcher entries to cover the unmangled inlined-
+# into name `inv`. Those were dropped at R25-01 verifier-tighten because
+# `pub fn inv` is `#[inline]`-inlined (no callable `inv` symbol present in
+# the bench binary's `nm` output); the `fun:inv` matchers were dormant
+# cruft. The `fun:*kernel_inv_legacy*` wildcard alone covers all observed
+# stack-frame attributions empirically. Verified by inversion test:
+# emptying this file reproduces all 3/15 inv-zero-guard warnings; keeping
+# only the wildcard matchers suppresses them. See FIX_PLAN.html #r25-01
+# v2 closure verifier report for the empirical evidence.
+#
+# Reviewed at R25-01 closure (2026-05-19). Tightened at verifier-suggested
+# follow-up commit (drop dormant `fun:inv` shape; keep `fun:*kernel_inv_legacy*`
+# wildcard) per maintainer-locked path (b) "tighten then accept". Stale-check
+# at next R-round.
+
+{
+   inv-zero-guard-domain-error-cond-r25-01-2026-05-19
+   Memcheck:Cond
+   fun:*kernel_inv_legacy*
+   ...
+}
+
+{
+   inv-zero-guard-domain-error-value8-r25-01-2026-05-19
+   Memcheck:Value8
+   fun:*kernel_inv_legacy*
+   ...
+}

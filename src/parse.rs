@@ -54,10 +54,57 @@ impl std::fmt::Debug for LegacyShare {
 // for non-Zeroize fields (`threshold`/`index` are non-secret integers we
 // deliberately don't want to scrub). Hand-rolled Drop only touches the
 // secret-bearing `payload`.
+//
+// R14-03 Sub-A.1: a `#[cfg(test)]`-gated atomic counter records each
+// invocation of Drop AFTER the zeroize side-effect. The
+// `legacy_share_drop_zeroize_observed` test below reads the counter
+// pre/post-drop to discriminate the `:59:9: replace <impl Drop for
+// LegacyShare>::drop with ()` mutant (which skips the increment).
+// Release-mode behaviour is byte-identical: the counter line is
+// stripped from non-test builds, leaving the same `self.payload.zeroize()`
+// body.
 impl Drop for LegacyShare {
     fn drop(&mut self) {
         self.payload.zeroize();
+        #[cfg(test)]
+        observe_legacy_share_zeroize();
     }
+}
+
+// R14-03 Sub-A.1 test-only instrumentation. The counter is incremented by
+// the Drop body AFTER zeroize. The counter line is wrapped in
+// `observe_legacy_share_zeroize()` and annotated
+// `#[cfg_attr(test, mutants::skip)]` so cargo-mutants does NOT mutate the
+// test-only instrumentation itself (matching the R14-02 pattern around
+// `observe_truncate_assign`). The skip is production-irrelevant because
+// the function is fully `#[cfg(test)]`-gated.
+#[cfg(test)]
+static LEGACY_SHARE_ZEROIZE_OBSERVED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+#[cfg_attr(test, mutants::skip)]
+fn observe_legacy_share_zeroize() {
+    LEGACY_SHARE_ZEROIZE_OBSERVED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// R14-03 Sub-A.1: process-wide Mutex<()> serialization for the
+// `legacy_share_drop_zeroize_observed` test. cargo test runs tests in
+// parallel by default, so multiple tests constructing/dropping
+// `LegacyShare` instances could race on the shared counter and false-
+// positive the post > pre assertion. The lock is the in-tree fallback
+// for `serial_test::serial(...)` (not a dev-dep here).
+#[cfg(test)]
+static LEGACY_SHARE_ZEROIZE_OBSERVED_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn with_legacy_share_zeroize_observed_lock<F: FnOnce()>(f: F) {
+    // Recover from poisoning: a panicking test must NOT permanently
+    // poison the lock for other tests that observe the counter.
+    let _guard = LEGACY_SHARE_ZEROIZE_OBSERVED_LOCK
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    f();
 }
 
 /// Parse a single share line of the form `T-N-base64`. Returns the
@@ -231,5 +278,39 @@ mod tests {
             !dbg.contains("[65, 66, 67, 68]"),
             "Debug leaked Vec<u8> array form: {dbg}"
         );
+    }
+
+    // R14-03 Sub-A.1: discriminate the
+    // `src/parse.rs:59:9: replace <impl Drop for LegacyShare>::drop with ()`
+    // mutant. The production Drop body calls `payload.zeroize()` and then
+    // increments the test-only counter; the mutant replaces the entire
+    // Drop body with `()` (no zeroize, no counter increment). The test
+    // constructs a `LegacyShare`, explicitly drops it, and asserts the
+    // counter incremented — which would NOT happen under the mutant.
+    //
+    // Serialized via LEGACY_SHARE_ZEROIZE_OBSERVED_LOCK so a parallel
+    // test that also constructs `LegacyShare` cannot race with the
+    // pre/post counter reads.
+    #[test]
+    fn legacy_share_drop_zeroize_observed() {
+        use std::sync::atomic::Ordering;
+        with_legacy_share_zeroize_observed_lock(|| {
+            let pre = LEGACY_SHARE_ZEROIZE_OBSERVED.load(Ordering::Relaxed);
+            {
+                let share = LegacyShare {
+                    threshold: 2,
+                    index: 1,
+                    payload: vec![0xA5u8; 36],
+                };
+                drop(share);
+            }
+            let post = LEGACY_SHARE_ZEROIZE_OBSERVED.load(Ordering::Relaxed);
+            assert!(
+                post > pre,
+                "LegacyShare::drop must run and observe the counter; \
+                 pre={pre} post={post} — `:59:9: replace <impl Drop for \
+                 LegacyShare>::drop with ()` mutant active?"
+            );
+        });
     }
 }

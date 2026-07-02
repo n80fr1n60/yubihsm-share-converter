@@ -46,6 +46,8 @@ htmlcov/
 /tmp/
 /crux-build/
 /results/
+/mutants.out/
+/mutants.out.old/
 /FIX_PLAN.html
 
 # Coverage/profiling artifacts
