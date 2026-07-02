@@ -193,17 +193,17 @@ run_dudect() {
   # R26-01 v4 (path c, ADVISORY-only) probe-then-invoke for scheduling tools.
   # Probes taskset + nice ONCE at start of run_dudect; per-iteration
   # invocation runs ONCE. See FIX_PLAN.html #r26-01 + MED-1 fix.
-  local pin_cmd=""
-  local nice_cmd=""
+  local -a pin_cmd=()
+  local -a nice_cmd=()
   if command -v taskset >/dev/null 2>&1; then
-    pin_cmd="taskset -c $(($(nproc) - 1))"
-    echo "  pin: $pin_cmd (last core; lower IRQ load on stock Linux)" | tee -a "$logfile"
+    pin_cmd=(taskset -c "$(($(nproc) - 1))")
+    echo "  pin: ${pin_cmd[*]} (last core; lower IRQ load on stock Linux)" | tee -a "$logfile"
   else
     echo "  warn: taskset not available; running unpinned (ADVISORY signal less clean)" | tee -a "$logfile"
   fi
   if command -v nice >/dev/null 2>&1 && nice -n -10 true 2>/dev/null; then
-    nice_cmd="nice -n -10"
-    echo "  nice: $nice_cmd (probe succeeded)" | tee -a "$logfile"
+    nice_cmd=(nice -n -10)
+    echo "  nice: ${nice_cmd[*]} (probe succeeded)" | tee -a "$logfile"
   else
     echo "  warn: nice -n -10 probe failed (CAP_SYS_NICE absent or 'nice' not in PATH); running at default niceness (ADVISORY signal less clean)" | tee -a "$logfile"
   fi
@@ -211,7 +211,7 @@ run_dudect() {
   for run in {1..20}; do
     for sub in "${subcases[@]}"; do
       local raw
-      raw=$($pin_cmd $nice_cmd "$binary" --kernel "$sub" 2>&1 | tee -a "$logfile")
+      raw=$("${pin_cmd[@]}" "${nice_cmd[@]}" "$binary" --kernel "$sub" 2>&1 | tee -a "$logfile")
       measurement_count=$((measurement_count + 1))
 
       # Parse the harness's output line:

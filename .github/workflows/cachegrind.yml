@@ -129,7 +129,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends valgrind=1:3.18.1-1ubuntu2
           valgrind --version
       - name: Build cachegrind harness
-        run: cargo build --release --bench cachegrind_kernels --no-run --locked
+        run: cargo bench --no-run --bench cachegrind_kernels --locked
       - name: Locate harness binary
         id: locate-binary
         run: |
