@@ -147,7 +147,12 @@ jobs:
             https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init.sha256
           expected="$(cut -d ' ' -f1 rustup-init.sha256)"
           actual="$(sha256sum rustup-init | cut -d ' ' -f1)"
-          test "$actual" = "$expected"
+          if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+            echo "FATAL: rustup-init sha256 mismatch" >&2
+            echo "expected: $expected" >&2
+            echo "actual  : $actual" >&2
+            exit 1
+          fi
           chmod +x rustup-init
           ./rustup-init -y --profile minimal --default-toolchain "$TOOLCHAIN"
           rm -f rustup-init rustup-init.sha256
