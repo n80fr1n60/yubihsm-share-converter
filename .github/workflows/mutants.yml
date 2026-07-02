@@ -10,7 +10,7 @@ name: Mutants
 #
 # Schedule: Monday 06:00 UTC, plus workflow_dispatch for manual runs.
 # The job opens a GitHub Issue if the kill-ratio dips below the 95%
-# absolute floor (LOCKED at R12-v2-residue). The Issue is the
+# absolute floor. The Issue is the
 # regression alert; the CI run itself remains non-blocking so a
 # transient flaky test cannot wedge the PR pipeline.
 
@@ -29,7 +29,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  KILL_RATIO_FLOOR: '0.95'    # R12-v2-residue lock: 95% absolute floor
+  # Locked floor. Current local baseline after targeted survivor tests
+  # (2026-05-13): 185 caught / (185 caught + 9 missed + 0 timeout) = 0.9536.
+  KILL_RATIO_FLOOR: '0.95'
 
 jobs:
   mutants:
@@ -37,6 +39,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360   # mutants can run for hours; cap at 6h
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install rustup (per-run sha256 verification)
         env:
@@ -66,11 +73,18 @@ jobs:
       - name: Install cargo-mutants
         run: cargo install cargo-mutants --locked
       - name: Run cargo-mutants
-        # --in-place: mutate the working tree (default; cargo-mutants
-        #             reverts each mutation after testing).
+        # Default copy mode: compatible with --jobs and keeps each
+        #             parallel mutation in an isolated scratch tree.
         # --no-shuffle: deterministic mutation order for reproducible
         #             regression reports.
-        # --timeout 60: per-mutation test timeout in seconds.
+        # --timeout 120: per-mutation test timeout in seconds. Doubled from
+        #          the prior 60s baseline because GitHub's hosted runners
+        #          are compute-limited and a stricter cap was producing
+        #          spurious timeouts (counted as kills, but masking actual
+        #          slow-test signal). 120s gives the test suite headroom
+        #          on a cold-cache mutated tree without inflating the wall-
+        #          clock budget meaningfully (the run is dominated by
+        #          rebuilds, not test execution).
         # --colors never: clean output for issue body parsing.
         # --jobs 2: bounded parallelism; the test suite has parallel-
         #          sensitive tests (dhat heap-alloc check), so we keep
@@ -82,51 +96,50 @@ jobs:
         id: run-mutants
         run: |
           set -e
-          mkdir -p mutants-out
+          out_dir=mutants.out
+          rm -rf "$out_dir" "$out_dir.old"
           # Run mutants; capture exit so a single missed mutant doesn't
           # kill the job (we want to compute the ratio either way).
           set +e
           cargo mutants \
-            --in-place \
             --no-shuffle \
-            --timeout 60 \
+            --timeout 120 \
             --colors never \
             --jobs 2 \
-            --output mutants-out \
+            --output . \
             -- --release --locked
           rc=$?
           set -e
           echo "mutants exit code: $rc"
+          if [ ! -f "$out_dir/outcomes.json" ]; then
+            echo "FATAL: cargo-mutants did not produce $out_dir/outcomes.json; refusing to report a fake 100% kill ratio." >&2
+            exit 1
+          fi
           # mutants emits caught.txt / missed.txt / timeout.txt /
           # unviable.txt in the output dir. Compute the kill ratio.
-          caught=$(wc -l < mutants-out/mutants.out/caught.txt 2>/dev/null || echo 0)
-          missed=$(wc -l < mutants-out/mutants.out/missed.txt 2>/dev/null || echo 0)
-          timeout_=$(wc -l < mutants-out/mutants.out/timeout.txt 2>/dev/null || echo 0)
+          caught=$(wc -l < "$out_dir/caught.txt" 2>/dev/null || echo 0)
+          missed=$(wc -l < "$out_dir/missed.txt" 2>/dev/null || echo 0)
+          timeout_=$(wc -l < "$out_dir/timeout.txt" 2>/dev/null || echo 0)
           # Unviable mutations (those that fail to compile) are
           # excluded from the ratio — they're not real coverage gaps.
           total=$((caught + missed + timeout_))
           if [ "$total" -eq 0 ]; then
-            {
-              echo "kill_ratio=1.0"
-              echo "caught=0"
-              echo "missed=0"
-              echo "timeout=0"
-            } >> "$GITHUB_OUTPUT"
-          else
-            kill_ratio=$(awk "BEGIN {printf \"%.4f\", ($caught + $timeout_) / $total}")
-            {
-              echo "kill_ratio=$kill_ratio"
-              echo "caught=$caught"
-              echo "missed=$missed"
-              echo "timeout=$timeout_"
-            } >> "$GITHUB_OUTPUT"
+            echo "FATAL: cargo-mutants reported zero caught/missed/timeout mutants; treating as a no-op run." >&2
+            exit 1
           fi
+          kill_ratio=$(awk "BEGIN {printf \"%.4f\", ($caught + $timeout_) / $total}")
+          {
+            echo "kill_ratio=$kill_ratio"
+            echo "caught=$caught"
+            echo "missed=$missed"
+            echo "timeout=$timeout_"
+          } >> "$GITHUB_OUTPUT"
       - name: Upload mutants output
         if: always()
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mutants-out
-          path: mutants-out/
+          path: mutants.out/
           retention-days: 90
       - name: Check kill-ratio floor
         env:
@@ -145,7 +158,7 @@ jobs:
           fi
       - name: Open regression Issue (kill ratio below floor)
         if: env.kill_ratio_below_floor == '1'
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |

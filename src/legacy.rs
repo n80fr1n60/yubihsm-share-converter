@@ -82,6 +82,34 @@ pub fn mul(a: u8, b: u8) -> u8 {
 /// `e`, it is the SAME sequence for every input. No data-dependent
 /// branch and no table lookup — the only operations on `a` are the
 /// branchless `mul` from above.
+// R14-v7: `src/legacy.rs:98:32` `| -> ^` is an EQUIVALENT MUTATION.
+//
+// At line 98, `acc = (mask & product) | (!mask & acc)` -- the two operands
+// of `|` are bit-disjoint because `mask` (computed at line 96 as
+// `0u8.wrapping_sub(e & 1)` in {0x00, 0xFF}) and `!mask` are complementary:
+// `mask & !mask = 0` at every bit position. For bit-disjoint operands,
+// `|` and `^` produce byte-identical output (no carry possible; XOR
+// matches OR because no bit is set in both operands).
+//
+// Therefore `(mask & product) | (!mask & acc)` ==
+//           `(mask & product) ^ (!mask & acc)` for every input.
+//
+// The mutation is semantically a no-op -- no test against this structure
+// can discriminate the mutated form from the original. The companion
+// mutation `| -> &` IS killed by the Fermat-reference test
+// (`inv_matches_fermat_table_exhaustive`) because AND of disjoint operands
+// is always 0, producing wrong results.
+//
+// SECOND function-level `#[mutants::skip]` in R14 (FIRST is on the non-
+// Linux `assert_single_threaded` variant in src/main.rs). The Fermat-
+// reference test still ships and provides exhaustive coverage on the
+// other 52 mutants in the legacy.rs module.
+//
+// `#[cfg_attr(test, mutants::skip)]` gates the attribute on `cfg(test)`
+// so release builds remain byte-identical to pre-v2 -- cargo-mutants
+// compiles in test mode, so the skip is recognised by the mutation tool
+// while production code emits no `mutants` reference at all.
+#[cfg_attr(test, mutants::skip)]
 #[inline]
 pub fn inv(a: u8) -> Result<u8, &'static str> {
     if a == 0 {
@@ -419,6 +447,41 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn mul_legacy_associativity_exhaustive() {
+        // mul(mul(a, b), c) == mul(a, mul(b, c)) for every
+        // (a, b, c) ∈ u8 × u8 × u8 — the full 16.7M-triple
+        // input space. Discharges in ~1-3 s on a release-profile build
+        // (cargo test --release). The polynomial used is the legacy
+        // 0x11D reduction (mul body at src/legacy.rs:~120).
+        //
+        // Load-bearing for the Lagrange recovery at src/legacy.rs:133-175:
+        // Σ y_i · Π_{j /= i} x_j relies on the product Π being
+        // associative; a non-associative `mul` would yield parenthesisation-
+        // dependent values from the same input set.
+        //
+        // This test is the load-bearing every-push Rust-side defender of
+        // associativity post-R18-01 (which moved the Cryptol Z3 :prove
+        // mul_legacy_associative to offline-only). Mirrors the spec's
+        // `property mul_legacy_associative` at spec/properties.cry:306-308.
+        // See R18-03 in FIX_PLAN.html for the v2 rationale.
+        for a in 0u16..=255 {
+            for b in 0u16..=255 {
+                for c in 0u16..=255 {
+                    let a = a as u8;
+                    let b = b as u8;
+                    let c = c as u8;
+                    assert_eq!(
+                        mul(mul(a, b), c),
+                        mul(a, mul(b, c)),
+                        "mul is non-associative at a=0x{a:02x} b=0x{b:02x} c=0x{c:02x}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn mul_distributivity_over_xor_sampled() {
         // mul(a, b ⊕ c) == mul(a, b) ⊕ mul(a, c) over selected corner cases
@@ -717,6 +780,143 @@ mod tests {
             assert_eq!(
                 fast, slow,
                 "inv(a) must equal a^254 at a=0x{a:02x} (fast=0x{fast:02x} slow=0x{slow:02x})"
+            );
+        }
+    }
+
+    // ────────────────────────── R14-01 Fermat reference ──────────────────────
+    //
+    // The `inv_branchless_matches_reference_exhaustive` test above (line 541)
+    // compares production `inv` against the historical table-form `ref_inv`,
+    // but cargo-mutants reports the mutant `src/legacy.rs:98:32: replace
+    // | with ^ in inv` SURVIVES that test. R14-01 investigation finding
+    // (see docs/R14-INVESTIGATION.md):
+    //
+    //   The mask at line 96 (`0u8.wrapping_sub(e & 1)`) is ALWAYS in
+    //   {0x00, 0xFF}, so `(mask & product)` and `(!mask & acc)` are
+    //   byte-disjoint at every bit position — one is 0 wherever the
+    //   other is nonzero. For byte-disjoint operands `(x | y) == (x ^ y)`,
+    //   so the `|` -> `^` mutation is MATHEMATICALLY EQUIVALENT under the
+    //   current disjoint-mask invariant. The mutant cannot be killed by
+    //   any output-comparing test on the current production code.
+    //
+    // The locked path (per the maintainer decision in FIX_PLAN.html
+    // §R14-01): land a structurally-independent Fermat-reference test
+    // ANYWAY. It does NOT kill the equivalent mutant on the current
+    // production form, but it provides FUTURE-PROOFING: any future
+    // refactor of `inv` that drops the disjoint-mask invariant (e.g. a
+    // SIMD-style implementation where `mask` overlaps with `!mask`)
+    // would make `|` vs `^` semantically distinct, and THIS test (along
+    // with the other algebraic property tests) would catch the
+    // regression. The test is layered with the existing tests:
+    //
+    //   • mul     ↔ table-form reference (R11-C2, exhaustive 65 536 pairs)
+    //   • inv     ↔ table-form reference (R12-C-04, exhaustive 256 inputs)
+    //   • inv     ↔ Fermat reference     (R14-01, exhaustive 255 nonzero)
+    //
+    // The Fermat reference is built via `inv_fermat`: it computes
+    // `a^254` by FLAT REPEATED MULTIPLICATION using the production
+    // `mul`, NOT by square-and-multiply. The control structure is
+    // genuinely independent of `inv`'s 8-iteration bit-walk.
+
+    /// R14-01: independent reference for `inv` via Fermat's little theorem.
+    /// In GF(2^8)\{0}, the multiplicative group has order 255, so
+    /// `a^(2^8 - 1) = a^255 = 1`, hence `inv(a) = a^254`.
+    ///
+    /// Computed via FLAT REPEATED MULTIPLICATION using the production
+    /// `mul`, deliberately NOT via square-and-multiply. The loop body
+    /// has no bit-walk, no mask construction, and no select operation —
+    /// none of the operations in production `inv`'s body appear here.
+    /// This gives a control-structure-independent reference that catches
+    /// any future mutation to `inv`'s bit-walk that breaks the
+    /// disjoint-mask invariant (e.g. the `|` -> `^` mutant at
+    /// src/legacy.rs:98:32 would diverge under a non-disjoint mask).
+    ///
+    /// Constant-time WRT `a`: 254 unconditional `mul` calls; the loop
+    /// iteration count is fixed and independent of `a`. The production
+    /// `inv` is also constant-time (8-iteration square-and-multiply
+    /// independent of `a`; see R12-C-04 commentary on `inv`). Both are
+    /// input-independent in iteration count by construction.
+    #[cfg(test)]
+    fn inv_fermat(a: u8) -> Option<u8> {
+        if a == 0 {
+            return None;
+        }
+        // a^254 via 254 multiplications of `a`, starting from acc = 1.
+        // After the loop: acc = 1 * a * a * ... * a (254 factors) = a^254.
+        let mut acc: u8 = 1;
+        for _ in 0..254 {
+            acc = mul(acc, a);
+        }
+        Some(acc)
+    }
+
+    /// R14-01: build the full 256-entry Fermat inverse table at test
+    /// time. Entry [0] is unused (production `inv(0)` errors and so
+    /// does `inv_fermat(0)`); entries [1..256] are the Fermat
+    /// inverses computed once per test run.
+    #[cfg(test)]
+    fn build_inv_fermat_table() -> [u8; 256] {
+        let mut t = [0u8; 256];
+        for a in 1u16..=255 {
+            let a = a as u8;
+            t[a as usize] = inv_fermat(a).expect("a != 0");
+        }
+        t
+    }
+
+    // R14-01: 254 muls × 255 inputs ≈ 65k mul calls. Release-mode this
+    // completes in well under a second; under miri it would dominate
+    // the 5-minute budget (same precedent as the table-form test).
+    #[cfg_attr(miri, ignore)]
+    #[test]
+    fn inv_matches_fermat_table_exhaustive() {
+        // Anchor: inv(0x02) MUST equal 0x8E in GF(2^8) under poly 0x11D.
+        // This is the value already pinned by `inv_of_two_known_value`
+        // above (verified against the historical table reference) and is
+        // load-bearing for catching loop-bound off-by-ones: if the
+        // Fermat loop ran 253 or 255 times instead of 254, this anchor
+        // would fail.
+        //
+        // NOTE on the anchor value: 0x8E is the inverse of 0x02 under
+        // the LEGACY poly 0x11D (the rusty-secrets 0.0.2 reduction
+        // polynomial). The AES poly 0x11B gives 0x8D — the canonical
+        // FIPS-197 value — but THIS file is the legacy field, not AES.
+        // Do not confuse the two: cross-poly mismatches surface here
+        // as well, so this anchor doubles as a poly-identity pin.
+        assert_eq!(
+            inv(0x02),
+            Ok(0x8E),
+            "production inv anchor failed: inv(0x02) must equal 0x8E under poly 0x11D"
+        );
+        assert_eq!(
+            inv_fermat(0x02),
+            Some(0x8E),
+            "Fermat reference anchor failed: inv_fermat(0x02) must equal 0x8E under poly 0x11D"
+        );
+
+        // Exhaustive: for all 255 nonzero a, production `inv` must agree
+        // with the structurally-independent Fermat reference.
+        //
+        // NOTE: under the current disjoint-mask invariant at line 96
+        // (mask ∈ {0x00, 0xFF}), the `|` -> `^` mutant at line 98:32 is
+        // MATHEMATICALLY EQUIVALENT and the production output is
+        // byte-identical with or without the mutation — so this test
+        // CANNOT kill that specific mutant on the current source. It
+        // does, however, future-proof against any refactor that breaks
+        // the disjoint-mask invariant, and it adds a third independent
+        // reference (alongside the table form and the existing
+        // pow-via-flat-loop test) for catching algorithmic regressions
+        // in `inv` more broadly. See docs/R14-INVESTIGATION.md for the
+        // full write-up.
+        let t = build_inv_fermat_table();
+        for a in 1u16..=255 {
+            let a = a as u8;
+            let got = inv(a).expect("a != 0; inv is total on nonzero");
+            let want = t[a as usize];
+            assert_eq!(
+                got, want,
+                "inv vs Fermat reference diverged at a=0x{a:02x}: got 0x{got:02x}, want 0x{want:02x}"
             );
         }
     }

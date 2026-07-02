@@ -18,6 +18,34 @@ name: Fuzz
 # workflow copies them to `fuzz/corpus/<target>/` (the standard
 # cargo-fuzz corpus path) before invoking the fuzzer. A missing
 # corpus_seed directory FAILS the run (cp -r returns non-zero).
+#
+# R19-01: nightly toolchain pin (`nightly-2026-05-03`). Rationale:
+# upstream rustc nightlies built on or after 2026-05-03 (i.e. the
+# `nightly-2026-05-04` release channel and later) tightened the
+# "reserved namespace" gate, rejecting external crates that use
+# `rustc_*` attribute names (even when gated behind
+# `#[cfg_attr(rustc_attrs, ...)]`). cargo-fuzz's published Cargo.lock
+# pins `rustix 0.36.5`, which uses these reserved attributes; therefore
+# `cargo install cargo-fuzz --locked` fails to compile rustix under any
+# unpinned `nightly` reference. The pin to `nightly-2026-05-03` is the
+# freshest empirically-verified pre-lockdown day (probe ledger:
+# 2026-04-17 OK / 2026-05-01 OK / 2026-05-03 OK (rustc 20de910db) /
+# 2026-05-04 FAIL (rustc ad3a598ca; lockdown landing day) /
+# 2026-05-05 FAIL / 2026-05-08 FAIL / 2026-05-14 FAIL).
+#
+# Rotation playbook: bump the pin when (a) cargo-fuzz publishes a new
+# lockfile pinning a modern rustix (rustix 0.37+ has migrated off the
+# reserved attribute names; check the cargo-fuzz crate's Cargo.lock at
+# release-time), OR (b) the project needs a newer nightly feature (a
+# new MIRIFLAG, a new -Z compiler flag, a new fuzz sanitizer), OR (c)
+# a relevant rustc security advisory lands in a newer nightly we'd
+# want. To bump: (i) pick a candidate date YYYY-MM-DD; (ii) run the
+# empirical probe locally — `rustup install nightly-YYYY-MM-DD
+# --profile minimal && cargo +nightly-YYYY-MM-DD install cargo-fuzz
+# --locked --root /tmp/probe`; (iii) verify exit 0 + no rustix compile
+# error in the probe log; (iv) update both the `TOOLCHAIN:` value and
+# the `cargo +nightly-YYYY-MM-DD fuzz run` invocation; (v) update this
+# rationale block's probe ledger with the new working day.
 
 on:
   schedule:
@@ -61,6 +89,11 @@ jobs:
       fail-fast: false
     timeout-minutes: 75   # 50min fuzz + setup/teardown headroom
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Skip non-matching cron slot
         # Each cron event runs the entire matrix by default; skip the
         # entries that don't match the scheduled hour. workflow_dispatch
@@ -98,7 +131,7 @@ jobs:
       - name: Install rustup (per-run sha256 verification)
         if: steps.route.outputs.skip != 'true'
         env:
-          TOOLCHAIN: nightly
+          TOOLCHAIN: nightly-2026-05-03
         run: |
           set -e
           # Sidecar pattern (mirrors ci.yml): download rustup-init AND
@@ -145,14 +178,40 @@ jobs:
         if: steps.route.outputs.skip != 'true'
         env:
           TARGET: ${{ matrix.target }}
+          # R21-02: ASAN_OPTIONS gates the ASAN internal-allocator
+          # policy. allocator_may_return_null=1 is DEFENCE-IN-DEPTH
+          # (NOT a recovery mechanism): it tells ASAN's allocator to
+          # return NULL on internal-pool OOM instead of aborting INSIDE
+          # the ASAN runtime. NOTE: Cargo.toml:55 sets panic = "abort"
+          # for release (which cargo-fuzz uses), and Rust's
+          # std::alloc::handle_alloc_error calls process::abort() by
+          # default, so any actual alloc-error path still SIGABRTs the
+          # libFuzzer process — collapsing the panic-vs-abort distinction.
+          # This flag prevents the most-common ASAN-internal-OOM-then-
+          # abort path but does NOT enable iteration-level recovery. The
+          # PRIMARY load-bearing fix is R21-01's harness clamp; this flag
+          # is structural insurance for the residual outlier.
+          ASAN_OPTIONS: allocator_may_return_null=1
         # 50min = 3000s libFuzzer time cap. -timeout=300 = 5min per-run
         # cap as a defence against infinite loops in a single input;
-        # libFuzzer reports each timeout but keeps going.
-        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=3000 -timeout=300
+        # libFuzzer reports each timeout but keeps going. R19-01: the
+        # `+nightly-2026-05-03` selector pins to the freshest known-
+        # working pre-lockdown nightly per the header comment block.
+        # R21-02: -rss_limit_mb=4096 RELAXES libFuzzer's documented
+        # default of -rss_limit_mb=2048 (2 GB) up to 4 GB so libFuzzer's
+        # RSS check tolerates ASAN's 5-10x shadow-memory amplification
+        # without falsely terminating on shadow-memory growth alone,
+        # while still being structurally bounded below the GitHub
+        # runner's 7 GB physical RAM. -detect_leaks=1 instructs
+        # libFuzzer to run LSan at exit + emit hard leak reports —
+        # without this flag, a future Secret leak regression could
+        # masquerade as a benign RSS-limit hit. Both flags work together
+        # with R21-01's clamp + the continue-on-error step-level posture.
+        run: cargo +nightly-2026-05-03 fuzz run "$TARGET" -- -max_total_time=3000 -timeout=300 -rss_limit_mb=4096 -detect_leaks=1
         continue-on-error: true
       - name: Upload crashes (if any)
         if: steps.route.outputs.skip != 'true' && always()
-        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1 # v4.6.1
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-${{ matrix.target }}-artifacts
           path: |

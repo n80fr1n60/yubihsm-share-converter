@@ -102,7 +102,7 @@ Mechanism: `continue-on-error: true` is set at the job level during the
 soak period, then a follow-up PR per Step 1 above removes that line.
 After the flip, the cron-side non-blocking posture is preserved via a
 job-level `if: github.event_name != 'schedule'` guard on the `Verify all
-llvm_verify directives returned Q.E.D.` step (or equivalent), so the
+llvm_verify directives succeeded` step (or equivalent), so the
 cron lane logs failures as warnings but does not block downstream
 workflows.
 

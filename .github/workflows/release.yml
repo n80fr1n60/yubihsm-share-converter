@@ -22,6 +22,11 @@ jobs:
     runs-on: ubuntu-latest
     # H7-3: inherits workflow-default contents: read; no override needed
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Install rustup (per-run sha256 verification)
         env:
@@ -87,6 +92,11 @@ jobs:
       fail-fast: false
     container: ${{ matrix.container }}
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Install build prerequisites
         run: |
           set -e
@@ -140,7 +150,7 @@ jobs:
           echo "STAGE=$STAGE" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5.0.0
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ env.STAGE }}
           path: |
@@ -154,6 +164,11 @@ jobs:
     permissions:
       contents: write   # H7-3: write-token scoped to this job only (publish release artifacts)
     steps:
+      - name: Harden the runner (Audit all outbound calls)
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
       - name: Download all artifacts
@@ -166,7 +181,7 @@ jobs:
         run: ls -la dist/
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@72f2c25fcb47643c292f7107632f7a47c1df5cd8 # v2.3.2
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           files: |
             dist/*.tar.gz
