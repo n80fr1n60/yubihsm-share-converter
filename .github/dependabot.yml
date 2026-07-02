@@ -14,3 +14,383 @@ updates:
     directory: "/.github/docker-pins"
     schedule:
       interval: "weekly"
+
+  - package-ecosystem: cargo
+    directory: /fuzz
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /saw/extracted
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/addr2line
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/adler2
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/aho-corasick
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/anstream
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/anstyle-parse
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/anstyle-query
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/anstyle-wincon
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/anstyle
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/arbitrary
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/assert_cmd
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/autocfg
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/backtrace
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/base64
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/bitflags
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/bstr
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/cc
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/cfg-if
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/clap
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/clap_builder
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/clap_derive
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/clap_lex
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/colorchoice
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/derive_arbitrary
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/dhat
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/find-msvc-tools
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/getrandom-0.2.17
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/getrandom
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/gimli
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/is_terminal_polyfill
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/itoa
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/jobserver
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/lazy_static
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/libc
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/libfuzzer-sys
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/lock_api
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/memchr
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/miniz_oxide
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/mintex
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/object
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/once_cell_polyfill
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/parking_lot
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/parking_lot_core
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/predicates-core
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/predicates-tree
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/predicates
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/proc-macro2
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/quote
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/r-efi
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/rand
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/redox_syscall
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/regex-automata
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/regex-syntax
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/regex
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/rustc-demangle
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/scopeguard
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/serde
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/serde_core
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/serde_derive
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/serde_json
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/smallvec
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/syn
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/termtree
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/unicode-ident
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/wait-timeout
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/wasi
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/wasip2
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/windows-link
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/windows-sys
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/wit-bindgen
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/zerocopy-derive
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/zerocopy
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/zeroize
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/zeroize_derive
+    schedule:
+      interval: daily
+
+  - package-ecosystem: cargo
+    directory: /vendor/zmij
+    schedule:
+      interval: daily
