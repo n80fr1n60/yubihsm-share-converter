@@ -111,10 +111,10 @@ fn main() {
     }
 
     // Emit `T-N-base64` lines on stdout. The base64 length is a function
-    // of payload_len: 36→48, 44→60, 52→70 unpadded chars.
+    // of payload_len: 36->48, 44->59, 52->70 unpadded chars.
     let expected_b64_len = match payload_len {
         36 => 48,
-        44 => 60,
+        44 => 59,
         52 => 70,
         _ => unreachable!(),
     };
