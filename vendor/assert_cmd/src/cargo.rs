@@ -142,7 +142,7 @@ where
 
 impl CommandCargoExt for crate::cmd::Command {
     fn cargo_bin<S: AsRef<str>>(name: S) -> Result<Self, CargoError> {
-        crate::cmd::Command::cargo_bin(name)
+        Self::cargo_bin(name)
     }
 }
 
@@ -173,7 +173,7 @@ pub(crate) fn cargo_runner() -> Option<Vec<String>> {
         CURRENT_TARGET.replace('-', "_").to_uppercase()
     );
     let runner = env::var(runner_env).ok()?;
-    Some(runner.split(' ').map(str::to_string).collect())
+    Some(runner.split(' ').map(str::to_owned).collect())
 }
 
 /// Error when finding crate binary.
@@ -232,16 +232,22 @@ pub fn cargo_bin<S: AsRef<str>>(name: S) -> path::PathBuf {
     cargo_bin_str(name.as_ref())
 }
 
+#[track_caller]
 fn cargo_bin_str(name: &str) -> path::PathBuf {
     let env_var = format!("{CARGO_BIN_EXE_}{name}");
-    env::var_os(env_var)
+    match env::var_os(env_var)
         .map(|p| p.into())
         .or_else(|| legacy_cargo_bin(name))
-        .unwrap_or_else(|| missing_cargo_bin(name))
+    {
+        Some(path) => path,
+        // Called manually so `#[track_caller]` is effective.
+        None => missing_cargo_bin(name),
+    }
 }
 
 const CARGO_BIN_EXE_: &str = "CARGO_BIN_EXE_";
 
+#[track_caller]
 fn missing_cargo_bin(name: &str) -> ! {
     let possible_names: Vec<_> = env::vars_os()
         .filter_map(|(k, _)| k.into_string().ok())

@@ -17,7 +17,7 @@ publish = false
 default-run = "yubihsm-share-converter"
 
 [dependencies]
-zeroize = { version = "1.7", features = ["zeroize_derive"] }
+zeroize = { version = "1.9", features = ["zeroize_derive"] }
 constant_time_eq = "0.3"
 clap = { version = "4.5", features = ["derive"] }
 libc = "0.2"
@@ -25,12 +25,12 @@ libc = "0.2"
 # Shamir split using Secret-controlled buffers (page-aligned, MADV_DONTDUMP,
 # zeroed-on-drop). vsss-rs 5.x leaked share bytes through internal coefficient
 # and per-share accumulator buffers that were outside our zeroize control.
-rand = "0.8"
+rand = "0.8.6"
 hex = "0.4"
 base64 = "0.22"
 
 [dev-dependencies]
-assert_cmd = "2"
+assert_cmd = "2.2.2"
 predicates = "3"
 # R11-C2 / R11-V2-residue: dhat is the heap-allocation profiler used by the
 # `recover_makes_at_most_one_heap_alloc` regression test in src/main.rs.

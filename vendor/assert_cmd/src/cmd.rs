@@ -154,6 +154,7 @@ impl Command {
     ///     .unwrap();
     /// ```
     ///
+    #[track_caller]
     pub fn unwrap(&mut self) -> process::Output {
         OutputOkExt::unwrap(self)
     }
@@ -171,6 +172,7 @@ impl Command {
     /// ```
     ///
     /// [Output]: std::process::Output
+    #[track_caller]
     pub fn unwrap_err(&mut self) -> OutputError {
         OutputOkExt::unwrap_err(self)
     }
@@ -190,6 +192,7 @@ impl Command {
     ///
     /// [`Output`]: std::process::Output
     #[must_use]
+    #[track_caller]
     pub fn assert(&mut self) -> Assert {
         OutputAssertExt::assert(self)
     }
@@ -455,7 +458,7 @@ impl Command {
         input: Option<Vec<u8>>,
         timeout: Option<std::time::Duration>,
     ) -> io::Result<process::Output> {
-        #![allow(clippy::unwrap_used)] // changes behavior in some tests
+        #![allow(clippy::unwrap_used, reason = "changes behavior in some tests")]
 
         fn read<R>(mut input: R) -> std::thread::JoinHandle<io::Result<Vec<u8>>>
         where
@@ -611,7 +614,7 @@ impl Command {
 
 impl From<process::Command> for Command {
     fn from(cmd: process::Command) -> Self {
-        Command::from_std(cmd)
+        Self::from_std(cmd)
     }
 }
 
@@ -631,6 +634,7 @@ impl OutputOkExt for &mut Command {
         }
     }
 
+    #[track_caller]
     fn unwrap_err(self) -> OutputError {
         match self.ok() {
             Ok(output) => {
@@ -655,6 +659,7 @@ impl OutputOkExt for &mut Command {
 }
 
 impl OutputAssertExt for &mut Command {
+    #[track_caller]
     fn assert(self) -> Assert {
         let output = match self.output() {
             Ok(output) => output,
