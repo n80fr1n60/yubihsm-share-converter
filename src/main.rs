@@ -754,10 +754,12 @@ fn main() -> ExitCode {
 
     // Recover from the first `threshold` shares; if at least 2*t shares
     // are available, recover again from a fully-disjoint second subset
-    // and constant-time compare. When t < n < 2t (the default
-    // 2-of-3 ceremony) the disjoint check is impossible but each EXTRA
-    // share's payload can be predicted from the canonical polynomial
-    // and compared byte-by-byte (R4-5 over-determined Lagrange). When
+    // and constant-time compare. For every redundant input (n > t), each
+    // EXTRA share's payload is also predicted from the canonical
+    // polynomial and compared as a full blob (R4-5 over-determined
+    // Lagrange). This second pass is intentionally not an `else if`: for
+    // n >= 2t it validates tail shares beyond the two disjoint subsets
+    // before --resplit can trust `shares.len()` as the output count. When
     // n == t there is no redundancy and --resplit is refused outright
     // BEFORE recover() runs.
     //
@@ -828,7 +830,9 @@ fn main() -> ExitCode {
             return ExitCode::from(4);
         }
         eprintln!("[ok] disjoint-subset cross-check passed");
-    } else if n > t {
+    }
+
+    if n > t {
         // R4-5: over-determined Lagrange cross-check. The polynomial is
         // uniquely defined by shares[..t]; predict each EXTRA share's
         // full Y-payload from the canonical polynomial and constant-time
@@ -1694,6 +1698,41 @@ mod tests {
     }
 
     #[test]
+    fn over_determined_catches_tail_corruption_after_disjoint_subsets() {
+        // Regression guard for n >= 2t: the disjoint-subset comparison
+        // only covers shares[..t] and shares[t..2*t]. A corrupt share
+        // after that range must still be checked by the over-determined
+        // validation pass before --resplit can trust shares.len().
+        let (secret, mut shares) = make_2of5_shares();
+
+        let blob_a = recover(&shares[..2], secret.len()).unwrap();
+        let blob_b = recover(&shares[2..4], secret.len()).unwrap();
+        assert_eq!(blob_a, secret);
+        assert_eq!(blob_b, secret);
+        assert!(constant_time_eq::constant_time_eq(&blob_a, &blob_b));
+
+        shares[4].payload[35] ^= 0x01;
+
+        let mut all_ok = true;
+        for s_extra in &shares[2..] {
+            let make_pts = || shares[..2].iter().map(|s| (s.index, s.payload.as_slice()));
+            let mut predicted: Zeroizing<Vec<u8>> =
+                Zeroizing::new(Vec::with_capacity(secret.len()));
+            for byte_idx in 0..secret.len() {
+                predicted.push(
+                    legacy::interp_at(make_pts, byte_idx, s_extra.index).expect("interp_at ok"),
+                );
+            }
+            all_ok &= constant_time_eq::constant_time_eq(&predicted, &s_extra.payload);
+        }
+
+        assert!(
+            !all_ok,
+            "over-determined validation must reject corrupt shares beyond 2*t"
+        );
+    }
+
+    #[test]
     fn over_determined_catches_single_byte_corruption_in_2_of_3() {
         // Build a clean 2-of-3 share set, then flip ONE byte at a non-
         // boundary AES-key offset (35 = position of an AES-256 key byte
@@ -2185,7 +2224,7 @@ mod tests {
     // accidentally reverts to byte-wise early-return, drops the
     // Zeroizing wrap, or short-circuits the per-share check.
 
-    /// Extract the over-determined branch source: from `else if n > t {`
+    /// Extract the over-determined branch source: from `if n > t {`
     /// down to the matching `} else {`. Returns a direct sub-slice of
     /// the `include_str!`'d source (zero allocation; the slice inherits
     /// the `'static` lifetime).
@@ -2208,8 +2247,8 @@ mod tests {
     fn over_determined_branch_source() -> &'static str {
         let src = include_str!("main.rs");
         let start = src
-            .find("else if n > t {")
-            .expect("main.rs must contain the `else if n > t {` over-determined guard");
+            .find("if n > t {")
+            .expect("main.rs must contain the `if n > t {` over-determined guard");
         // Find the next `} else {` (the n == t else branch) — that
         // delimits the over-determined branch end.
         let after = &src[start..];
